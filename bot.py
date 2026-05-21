@@ -1246,7 +1246,7 @@ async def _agent_step(
         perm_tcs = [tc for tc in tool_calls if tc["name"] not in AUTO_APPROVE_TOOLS]
 
     for tc in auto_tcs:
-        out      = await exec_tool(tc["name"], tc["args"], default_cwd=session_dir, chat_id=chat_id, tg_bot=_b)
+        out      = await exec_tool(tc["name"], tc["args"], default_cwd=session_dir, chat_id=chat_id, tg_bot=_bot)
         args_str = _fmt_args(tc["name"], tc["args"])
         short    = out[:500] + ("…" if len(out) > 500 else "")
         try:
@@ -1545,7 +1545,7 @@ async def tool_permission_cb(cb: CallbackQuery, state: FSMContext):
 
     result_messages = list(agent_messages)
     for tc in pending:
-        out      = await exec_tool(tc["name"], tc["args"], default_cwd=session_dir, chat_id=chat_id, tg_bot=_b)
+        out      = await exec_tool(tc["name"], tc["args"], default_cwd=session_dir, chat_id=chat_id, tg_bot=_bot)
         args_str = _fmt_args(tc["name"], tc["args"])
         short    = out[:600] + ("…" if len(out) > 600 else "")
         try:
