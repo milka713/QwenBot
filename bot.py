@@ -193,7 +193,7 @@ TOOLS = [
                 "type": "object",
                 "properties": {
                     "command":     {"type": "string", "description": "Shell command to run"},
-                    "working_dir": {"type": "string", "description": "Working directory (default: /home/mark)"},
+                    "working_dir": {"type": "string", "description": "Working directory (default: your session folder)"},
                 },
                 "required": ["command"],
             },
@@ -270,11 +270,11 @@ TOOLS = [
 AUTO_APPROVE_TOOLS = {"read_file", "list_dir", "search"}
 
 # ── Tool execution ────────────────────────────────────────────────────────────
-async def exec_tool(name: str, args: dict) -> str:
+async def exec_tool(name: str, args: dict, default_cwd: str = "/home/mark") -> str:
     try:
         if name == "bash":
             cmd = args.get("command", "")
-            cwd = args.get("working_dir") or "/home/mark"
+            cwd = args.get("working_dir") or default_cwd
             if not os.path.isdir(str(cwd)):
                 cwd = os.path.expanduser("~")
             proc = await asyncio.create_subprocess_shell(
@@ -992,6 +992,7 @@ async def _agent_step(
     state: FSMContext,
     bot: Optional[Bot] = None,
     db: Optional[aiosqlite.Connection] = None,
+    session_dir: str = "/home/mark",
 ):
     """One iteration of the agent loop. Calls itself (or waits for callback) until done."""
     _b = bot or _bot
@@ -1189,7 +1190,7 @@ async def _agent_step(
         perm_tcs = [tc for tc in tool_calls if tc["name"] not in AUTO_APPROVE_TOOLS]
 
     for tc in auto_tcs:
-        out      = await exec_tool(tc["name"], tc["args"])
+        out      = await exec_tool(tc["name"], tc["args"], default_cwd=session_dir)
         args_str = _fmt_args(tc["name"], tc["args"])
         short    = out[:500] + ("…" if len(out) > 500 else "")
         try:
@@ -1453,6 +1454,7 @@ async def tool_permission_cb(cb: CallbackQuery, state: FSMContext):
     turn           = data.get("agent_turn", 0)
     allow_all      = data.get("agent_allow_all", False)
     cancel_token   = data.get("agent_token", "")
+    session_dir    = data.get("session_dir", "/home/mark")
 
     if not pending:
         await cb.answer("No pending tools.", show_alert=True)
@@ -1477,6 +1479,7 @@ async def tool_permission_cb(cb: CallbackQuery, state: FSMContext):
         await _agent_step(
             chat_id, sid, model_key, result_messages,
             turn, allow_all, cancel_token, state,
+            session_dir=session_dir,
         )
         return
 
@@ -1486,7 +1489,7 @@ async def tool_permission_cb(cb: CallbackQuery, state: FSMContext):
 
     result_messages = list(agent_messages)
     for tc in pending:
-        out      = await exec_tool(tc["name"], tc["args"])
+        out      = await exec_tool(tc["name"], tc["args"], default_cwd=session_dir)
         args_str = _fmt_args(tc["name"], tc["args"])
         short    = out[:600] + ("…" if len(out) > 600 else "")
         try:
@@ -1510,6 +1513,7 @@ async def tool_permission_cb(cb: CallbackQuery, state: FSMContext):
         await _agent_step(
             chat_id, sid, model_key, result_messages,
             turn, allow_all, cancel_token, state,
+            session_dir=session_dir,
         )
     except Exception as e:
         LOG.exception("Unhandled error in _agent_step (tool_permission_cb)")
@@ -1622,6 +1626,7 @@ async def session_msg(msg: Message, state: FSMContext):
         return
 
     cancel_token = uuid.uuid4().hex
+    await state.update_data(session_dir=session_dir)
     await state.update_data(agent_running=True, agent_token=cancel_token)
 
     await add_msg(_db, sid, "user", text)
@@ -1635,7 +1640,12 @@ async def session_msg(msg: Message, state: FSMContext):
         await _db.execute("UPDATE sessions SET title=? WHERE id=?", (raw, sid))
         await _db.commit()
 
-    agent_messages = [{"role": "system", "content": SYSTEM_PROMPT}] + history
+    user      = await get_user(_db, msg.from_user.id)
+    key_name  = (user or {}).get("key_name") or "user"
+    session_dir = os.path.join(user_sessions_dir(key_name), sid)
+    os.makedirs(session_dir, exist_ok=True)
+    system_with_dir = SYSTEM_PROMPT + f"\n\nYour session working directory is: {session_dir}"
+    agent_messages = [{"role": "system", "content": system_with_dir}] + history
     allow_all      = data.get("allow_all", False)
 
     tokens = estimate_tokens(agent_messages)
@@ -1648,7 +1658,7 @@ async def session_msg(msg: Message, state: FSMContext):
         try:
             count, _ = await _auto_compress(_db, sid, model_key)
             new_history = await get_session_msgs(_db, sid)
-            agent_messages = [{"role": "system", "content": SYSTEM_PROMPT}] + new_history
+            agent_messages = [{"role": "system", "content": system_with_dir}] + new_history
             await msg.answer(
                 f"Сжато {count} сообщений → 1. <code>— {fmt_ctx(new_history, model_key)}</code>",
                 parse_mode="HTML",
@@ -1660,6 +1670,7 @@ async def session_msg(msg: Message, state: FSMContext):
         await _agent_step(
             msg.chat.id, sid, model_key,
             agent_messages, 0, allow_all, cancel_token, state,
+            session_dir=session_dir,
         )
     except Exception as e:
         LOG.exception("Unhandled error in _agent_step")
