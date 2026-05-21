@@ -802,8 +802,10 @@ async def sc_compress(msg: Message, args: str, db, sid: str, model_key: str, sta
     except Exception as e:
         await wait.edit_text(f"⚠️ Compression failed: {_html.escape(str(e))}", parse_mode="HTML")
         return
+    new_history = await get_session_msgs(db, sid)
     await wait.edit_text(
-        f"Compressed {count} messages → 1 summary.\n\n"
+        f"Compressed {count} messages → 1 summary. "
+        f"<code>— {fmt_ctx(new_history)}</code>\n\n"
         f"<pre>{_html.escape(summary[:1000])}{'…' if len(summary) > 1000 else ''}</pre>",
         parse_mode="HTML",
     )
@@ -1013,7 +1015,10 @@ async def main():
             await add_msg(db, sid, "assistant", text)
             await state.update_data(agent_running=False)
 
-            response_html = to_html(text) if text else "(empty response)"
+            # Always append context footer to response
+            history = await get_session_msgs(db, sid)
+            ctx_footer = f'\n<code>— {fmt_ctx(history)}</code>'
+            response_html = (to_html(text) if text else "(empty response)") + ctx_footer
             chunks = chunk_text(response_html)
 
             async def send_chunks(delete_status: bool):
@@ -1040,7 +1045,6 @@ async def main():
                 except Exception:
                     await send_chunks(delete_status=True)
             elif len(chunks) == 1:
-                # Try in-place edit — on any failure delete+resend to avoid duplicate
                 try:
                     await status_msg.edit_text(chunks[0], parse_mode="HTML")
                 except Exception:
@@ -1048,28 +1052,25 @@ async def main():
             else:
                 await send_chunks(delete_status=True)
 
-            # ── Context check after final answer ────────────────────────────
-            try:
-                history = await get_session_msgs(db, sid)
-                tokens = estimate_tokens([{"role": "system", "content": SYSTEM_PROMPT}] + history)
-                if tokens >= CONTEXT_AUTO_COMPRESS:
-                    await bot.send_message(
-                        chat_id,
-                        f"⚠️ Context at {int(tokens*100/CONTEXT_LIMIT)}% ({tokens:,}/{CONTEXT_LIMIT:,}) — auto-compressing…",
-                    )
-                    try:
-                        count, _ = await _auto_compress(db, sid, model_key)
-                        await bot.send_message(chat_id, f"Compressed {count} messages → 1 summary.")
-                    except Exception as ce:
-                        await bot.send_message(chat_id, f"⚠️ Auto-compress failed: {_html.escape(str(ce))}", parse_mode="HTML")
-                elif tokens >= CONTEXT_WARN_TOKENS:
+            # ── Auto-compress if over limit ──────────────────────────────────
+            tokens = estimate_tokens([{"role": "system", "content": SYSTEM_PROMPT}] + history)
+            if tokens >= CONTEXT_AUTO_COMPRESS:
+                try:
                     pct = int(tokens * 100 / CONTEXT_LIMIT)
+                    await bot.send_message(chat_id, f"⚠️ Context {pct}% — auto-compressing…")
+                    count, _ = await _auto_compress(db, sid, model_key)
+                    new_history = await get_session_msgs(db, sid)
                     await bot.send_message(
                         chat_id,
-                        f"⚠️ Context at {pct}% ({tokens:,}/{CONTEXT_LIMIT:,} tokens). Use #compact to compress.",
+                        f"Compressed {count} messages → 1 summary. "
+                        f"<code>— {fmt_ctx(new_history)}</code>",
+                        parse_mode="HTML",
                     )
-            except Exception:
-                pass
+                except Exception as ce:
+                    await bot.send_message(chat_id, f"⚠️ Auto-compress failed: {_html.escape(str(ce))}", parse_mode="HTML")
+            elif tokens >= CONTEXT_WARN_TOKENS:
+                pct = int(tokens * 100 / CONTEXT_LIMIT)
+                await bot.send_message(chat_id, f"⚠️ Context {pct}% — используй #compact")
             return
 
         # ── There are tool calls ─────────────────────────────────────────────
@@ -1260,11 +1261,10 @@ async def main():
         label = MODELS.get(model_key, {}).get("label", model_key)
         tool_note = " · tools" if MODELS.get(model_key, {}).get("tools") else " · chat only"
         await cb.message.edit_text(
-            f"<b>{_html.escape(title)}</b> — {_html.escape(label)}{tool_note}\n"
-            f"ID: <code>{sid}</code>"
+            f"<b>{_html.escape(label)}</b>{tool_note}"
             + (f" · <b>{_html.escape(key_name)}</b>" if key_name else "") +
-            f"\nContext: {fmt_ctx([])}\n\n"
-            "Type your message or use <code>#help</code> for commands.",
+            f"\n<code>{sid}</code>\n\n"
+            "Пишите сообщение или <code>#help</code> для команд.",
             parse_mode="HTML",
         )
         await cb.message.answer("Session started.", reply_markup=SESSION_KB)
