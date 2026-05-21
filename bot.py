@@ -33,6 +33,7 @@ from aiogram.types import (
     ReplyKeyboardMarkup,
     ReplyKeyboardRemove,
 )
+from aiogram.types import FSInputFile
 import openai
 from openai import AsyncOpenAI
 
@@ -68,6 +69,46 @@ def to_latin(name: str) -> str:
 
 def user_sessions_dir(key_name: str) -> str:
     return os.path.join(USERS_DIR, to_latin(key_name), "sessions")
+
+async def download_attachment(msg, session_dir: str, tg_bot) -> str:
+    """Download file attachment to session dir. Returns description string for LLM."""
+    import mimetypes
+    parts = []
+
+    async def _save(file_id, filename):
+        file = await tg_bot.get_file(file_id)
+        dest = os.path.join(session_dir, filename)
+        await tg_bot.download_file(file.file_path, dest)
+        size = os.path.getsize(dest)
+        return dest, size
+
+    if msg.document:
+        fname = msg.document.file_name or f"file_{msg.document.file_unique_id}"
+        dest, size = await _save(msg.document.file_id, fname)
+        parts.append(f"[Attached file: {fname} ({size} bytes) → {dest}]")
+
+    if msg.photo:
+        fname = f"photo_{msg.photo[-1].file_unique_id}.jpg"
+        dest, size = await _save(msg.photo[-1].file_id, fname)
+        parts.append(f"[Attached photo → {dest}]")
+
+    if msg.video:
+        fname = msg.video.file_name or f"video_{msg.video.file_unique_id}.mp4"
+        dest, size = await _save(msg.video.file_id, fname)
+        parts.append(f"[Attached video: {fname} ({size} bytes) → {dest}]")
+
+    if msg.audio:
+        fname = msg.audio.file_name or f"audio_{msg.audio.file_unique_id}.mp3"
+        dest, size = await _save(msg.audio.file_id, fname)
+        parts.append(f"[Attached audio: {fname} ({size} bytes) → {dest}]")
+
+    if msg.voice:
+        fname = f"voice_{msg.voice.file_unique_id}.ogg"
+        dest, size = await _save(msg.voice.file_id, fname)
+        parts.append(f"[Attached voice message ({msg.voice.duration}s) → {dest}]")
+
+    return "\n".join(parts)
+
 
 
 def ctx_limits(model_key: str) -> tuple[int, int, int]:
@@ -264,13 +305,28 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "send_file",
+            "description": "Send a file from the server to the user in Telegram.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path":    {"type": "string", "description": "Absolute path to file on server"},
+                    "caption": {"type": "string", "description": "Optional caption for the file"},
+                },
+                "required": ["path"],
+            },
+        },
+    },
 ]
 
 # Read-only tools: auto-approved without asking user
-AUTO_APPROVE_TOOLS = {"read_file", "list_dir", "search"}
+AUTO_APPROVE_TOOLS = {"read_file", "list_dir", "search", "send_file"}
 
 # ── Tool execution ────────────────────────────────────────────────────────────
-async def exec_tool(name: str, args: dict, default_cwd: str = "/home/mark") -> str:
+async def exec_tool(name: str, args: dict, default_cwd: str = "/home/mark", chat_id: int = 0, tg_bot=None) -> str:
     try:
         if name == "bash":
             cmd = args.get("command", "")
@@ -1190,7 +1246,7 @@ async def _agent_step(
         perm_tcs = [tc for tc in tool_calls if tc["name"] not in AUTO_APPROVE_TOOLS]
 
     for tc in auto_tcs:
-        out      = await exec_tool(tc["name"], tc["args"], default_cwd=session_dir)
+        out      = await exec_tool(tc["name"], tc["args"], default_cwd=session_dir, chat_id=chat_id, tg_bot=_b)
         args_str = _fmt_args(tc["name"], tc["args"])
         short    = out[:500] + ("…" if len(out) > 500 else "")
         try:
@@ -1489,7 +1545,7 @@ async def tool_permission_cb(cb: CallbackQuery, state: FSMContext):
 
     result_messages = list(agent_messages)
     for tc in pending:
-        out      = await exec_tool(tc["name"], tc["args"], default_cwd=session_dir)
+        out      = await exec_tool(tc["name"], tc["args"], default_cwd=session_dir, chat_id=chat_id, tg_bot=_b)
         args_str = _fmt_args(tc["name"], tc["args"])
         short    = out[:600] + ("…" if len(out) > 600 else "")
         try:
@@ -1595,8 +1651,10 @@ async def session_msg(msg: Message, state: FSMContext):
     data      = await state.get_data()
     sid       = data.get("sid")
     model_key = data.get("model", DEFAULT_MODEL)
-    text      = (msg.text or "").strip()
-    if not sid or not text:
+    text      = (msg.text or msg.caption or "").strip()
+
+    has_attachment = bool(msg.document or msg.photo or msg.video or msg.audio or msg.voice)
+    if not sid or (not text and not has_attachment):
         return
 
     if text.startswith("/") or text.startswith("#"):
@@ -1633,11 +1691,28 @@ async def session_msg(msg: Message, state: FSMContext):
     cancel_token = uuid.uuid4().hex
     await state.update_data(agent_running=True, agent_token=cancel_token, session_dir=session_dir)
 
-    await add_msg(_db, sid, "user", text)
+    # Build full message: reply context + attachments + text
+    parts = []
+    if msg.reply_to_message:
+        reply = msg.reply_to_message
+        reply_text = (reply.text or reply.caption or "[media]")[:300]
+        parts.append(f"[Replying to message: \"{reply_text}\"]")
+    if has_attachment:
+        try:
+            attachment_info = await download_attachment(msg, session_dir, _bot)
+            if attachment_info:
+                parts.append(attachment_info)
+        except Exception as e:
+            parts.append(f"[Attachment download failed: {e}]")
+    if text:
+        parts.append(text)
+    full_text = "\n".join(parts) or "[empty message]"
+
+    await add_msg(_db, sid, "user", full_text)
     history = await get_session_msgs(_db, sid)
 
     if len(history) == 1:
-        raw = text.strip()
+        raw = text.strip() or full_text
         if len(raw) > 48:
             cut = raw[:48].rfind(' ')
             raw = (raw[:cut] if cut > 20 else raw[:48]) + '…'
