@@ -35,9 +35,9 @@ import openai
 from openai import AsyncOpenAI
 
 # ── Config ────────────────────────────────────────────────────────────────────
-BOT_TOKEN      = "REDACTED_TOKEN"
-DB_PATH        = "/home/mark/qwenbot/data.db"
-KEYS_PATH      = "/opt/api-keys.txt"
+BOT_TOKEN      = os.environ["BOT_TOKEN"]
+DB_PATH        = os.environ.get("DB_PATH",    "/home/mark/qwenbot/data.db")
+KEYS_PATH      = os.environ.get("KEYS_PATH",  "/opt/api-keys.txt")
 MAX_FAILS      = 3
 BAN_MINUTES    = 5
 MAX_AGENT_TURNS = 20
@@ -99,7 +99,7 @@ DEFAULT_MODEL = "code"
 
 SYSTEM_PROMPT = (
     "You are an expert AI coding assistant and system administrator. "
-    "IMPORTANT: You are running DIRECTLY on the Linux server (REDACTED_IP). "
+    "IMPORTANT: You are running DIRECTLY on the Linux server. "
     "Your bash tool executes commands ON THIS MACHINE — not on any remote server. "
     "There is no SSH needed. When the user says 'the server', they mean this machine you're on right now.\n\n"
     "You have these tools available RIGHT NOW — USE THEM:\n"
