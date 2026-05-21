@@ -410,6 +410,17 @@ async def exec_tool(name: str, args: dict, default_cwd: str = "/home/mark", chat
                 text = text[:TOOL_OUT_LIMIT] + "\n… [truncated]"
             return text or "[no matches]"
 
+        if name == "send_file":
+            path = args.get("path", "")
+            caption = args.get("caption", "")
+            if not os.path.isfile(path):
+                return f"[file not found: {path}]"
+            if not tg_bot or not chat_id:
+                return "[send_file: bot not available]"
+            f = FSInputFile(path)
+            await tg_bot.send_document(chat_id, f, caption=caption or None)
+            return f"[sent: {os.path.basename(path)}]"
+
         return f"[unknown tool: {name}]"
 
     except FileNotFoundError as e:
