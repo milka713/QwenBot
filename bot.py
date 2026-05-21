@@ -36,7 +36,7 @@ from openai import AsyncOpenAI
 
 # ── Config ────────────────────────────────────────────────────────────────────
 BOT_TOKEN      = os.environ["BOT_TOKEN"]
-DB_PATH        = os.environ.get("DB_PATH",    "/home/mark/qwenbot/data.db")
+DB_PATH        = os.environ.get("DB_PATH",    "/opt/qwenbot/data.db")
 KEYS_PATH      = os.environ.get("KEYS_PATH",  "/opt/api-keys.txt")
 MAX_FAILS      = 3
 BAN_MINUTES    = 5
@@ -44,7 +44,7 @@ MAX_AGENT_TURNS = 40
 BASH_TIMEOUT    = 60
 TOOL_OUT_LIMIT  = 5000
 
-SESSION_DIR = "/home/mark/qwenbot/sessions"
+SESSION_DIR    = os.environ.get("SESSION_DIR",  "/opt/qwenbot/sessions")
 
 def ctx_limits(model_key: str) -> tuple[int, int, int]:
     """Return (limit, warn_at, compress_at) for the given model."""
