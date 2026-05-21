@@ -1625,9 +1625,13 @@ async def session_msg(msg: Message, state: FSMContext):
         )
         return
 
+    user        = await get_user(_db, msg.from_user.id)
+    key_name    = (user or {}).get("key_name") or "user"
+    session_dir = os.path.join(user_sessions_dir(key_name), sid)
+    os.makedirs(session_dir, exist_ok=True)
+
     cancel_token = uuid.uuid4().hex
-    await state.update_data(session_dir=session_dir)
-    await state.update_data(agent_running=True, agent_token=cancel_token)
+    await state.update_data(agent_running=True, agent_token=cancel_token, session_dir=session_dir)
 
     await add_msg(_db, sid, "user", text)
     history = await get_session_msgs(_db, sid)
@@ -1639,11 +1643,6 @@ async def session_msg(msg: Message, state: FSMContext):
             raw = (raw[:cut] if cut > 20 else raw[:48]) + '…'
         await _db.execute("UPDATE sessions SET title=? WHERE id=?", (raw, sid))
         await _db.commit()
-
-    user      = await get_user(_db, msg.from_user.id)
-    key_name  = (user or {}).get("key_name") or "user"
-    session_dir = os.path.join(user_sessions_dir(key_name), sid)
-    os.makedirs(session_dir, exist_ok=True)
     system_with_dir = SYSTEM_PROMPT + f"\n\nYour session working directory is: {session_dir}"
     agent_messages = [{"role": "system", "content": system_with_dir}] + history
     allow_all      = data.get("allow_all", False)
