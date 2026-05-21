@@ -866,7 +866,794 @@ SESSION_COMMANDS: dict[str, Any] = {
 }
 
 
-# ── Bot ────────────────────────────────────────────────────────────────────────
+# ── Module-level app state (set by main, injectable for tests) ────────────────
+dp   = Dispatcher(storage=MemoryStorage())
+_bot: Optional[Bot] = None
+_db:  Optional[aiosqlite.Connection] = None
+
+
+# ── Auth guards ───────────────────────────────────────────────────────────────
+async def guard(
+    msg: Message,
+    state: FSMContext,
+    db: Optional[aiosqlite.Connection] = None,
+) -> bool:
+    _d = db or _db
+    uid  = msg.from_user.id
+    name = msg.from_user.username or msg.from_user.full_name or str(uid)
+    await ensure_user(_d, uid, name)
+    user = await get_user(_d, uid)
+    remaining = _ban_remaining(user.get("ban_until"))
+    if remaining is not None:
+        mins = int(remaining.total_seconds() // 60) + 1
+        await msg.answer(f"🚫 Too many failed attempts. Try again in {mins} min.")
+        return False
+    if not user["authed"]:
+        if user.get("ban_until"):
+            await clear_ban(_d, uid)
+        await state.set_state(S.auth)
+        await msg.answer("🔐 Send your access key:")
+        return False
+    return True
+
+
+async def guard_cb(
+    cb: CallbackQuery,
+    state: FSMContext,
+    db: Optional[aiosqlite.Connection] = None,
+) -> bool:
+    _d = db or _db
+    uid  = cb.from_user.id
+    name = cb.from_user.username or cb.from_user.full_name or str(uid)
+    await ensure_user(_d, uid, name)
+    user = await get_user(_d, uid)
+    remaining = _ban_remaining(user.get("ban_until"))
+    if remaining is not None:
+        mins = int(remaining.total_seconds() // 60) + 1
+        await cb.answer(f"🚫 Too many failed attempts. Try again in {mins} min.", show_alert=True)
+        return False
+    if not user["authed"]:
+        if user.get("ban_until"):
+            await clear_ban(_d, uid)
+        await state.set_state(S.auth)
+        await cb.answer("🔐 Please send /start to authenticate.", show_alert=True)
+        return False
+    return True
+
+
+# ── Sessions list helper ──────────────────────────────────────────────────────
+async def _send_sessions_list(
+    target,
+    uid: int,
+    key_name: str,
+    db: Optional[aiosqlite.Connection] = None,
+):
+    _d = db or _db
+    sessions = await list_user_sessions(_d, uid, key_name)
+    header   = f"Sessions for <b>{_html.escape(key_name)}</b>:" if key_name else "Your sessions:"
+    if not sessions:
+        await target.answer(
+            f"{header}\nNo sessions yet. Use + New Session.",
+            parse_mode="HTML", reply_markup=MAIN_KB,
+        )
+        return
+    buttons = []
+    for s in sessions:
+        icon  = "▶" if s["status"] == "active" else "○"
+        label = f"{icon} {s['title']}"
+        row   = [
+            InlineKeyboardButton(text=label,   callback_data=f"os:{s['id']}"),
+            InlineKeyboardButton(text="× del", callback_data=f"ds:{s['id']}"),
+        ]
+        buttons.append(row)
+    await target.answer(
+        header,
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+    )
+
+
+# ── Agent loop ────────────────────────────────────────────────────────────────
+async def _agent_step(
+    chat_id: int,
+    sid: str,
+    model_key: str,
+    agent_messages: list,
+    turn: int,
+    allow_all: bool,
+    cancel_token: str,
+    state: FSMContext,
+    bot: Optional[Bot] = None,
+    db: Optional[aiosqlite.Connection] = None,
+):
+    """One iteration of the agent loop. Calls itself (or waits for callback) until done."""
+    _b = bot or _bot
+    _d = db or _db
+
+    data = await state.get_data()
+    if data.get("agent_token", "") != cancel_token:
+        return
+
+    if turn >= MAX_AGENT_TURNS:
+        await _b.send_message(chat_id, f"⚠️ Reached max {MAX_AGENT_TURNS} turns. Stopping.", reply_markup=SESSION_KB)
+        await state.update_data(agent_running=False)
+        return
+
+    status_msg = await _b.send_message(chat_id, "⏳")
+    last_display = [""]
+
+    async def on_thinking(think: str):
+        short   = (think[-400:] + "…") if len(think) > 400 else think
+        display = f"💭 <tg-spoiler>{_html.escape(short)}</tg-spoiler>"
+        if display != last_display[0]:
+            last_display[0] = display
+            try:
+                await status_msg.edit_text(display, parse_mode="HTML")
+            except Exception:
+                pass
+
+    async def on_text(text: str):
+        display = to_html(text[-3800:] if len(text) > 3800 else text) or "⏳"
+        if display != last_display[0]:
+            last_display[0] = display
+            try:
+                await status_msg.edit_text(display, parse_mode="HTML")
+            except Exception:
+                pass
+
+    try:
+        thinking, text, tool_calls = await llm_stream_agent(
+            model_key, agent_messages, on_thinking, on_text,
+        )
+    except openai.APIStatusError as e:
+        label = MODELS.get(model_key, {}).get("label", model_key)
+        raw   = str(e.message or e).lower()
+        if e.status_code == 503:
+            err_text = (
+                f"⚠️ <b>{_html.escape(label)}</b> ещё загружается (503).\n"
+                f"Подожди и повтори, или переключись: <code>#model code</code>"
+            )
+        elif e.status_code in (400, 413) or any(
+            w in raw for w in ("context", "too long", "length", "token", "prompt", "exceed")
+        ):
+            err_text = (
+                f"⚠️ <b>Контекст переполнен</b> (HTTP {e.status_code}).\n"
+                f"Используй <code>#compact</code> чтобы сжать или <code>#clear</code> чтобы очистить."
+            )
+        else:
+            err_text = (
+                f"⚠️ API {e.status_code}: <code>{_html.escape(str(e.message or e)[:300])}</code>"
+            )
+        await status_msg.edit_text(err_text, parse_mode="HTML")
+        await state.update_data(agent_running=False)
+        return
+    except openai.APIConnectionError:
+        label = MODELS.get(model_key, {}).get("label", model_key)
+        await status_msg.edit_text(
+            f"⚠️ Нет связи с <b>{_html.escape(label)}</b>.\n"
+            f"Модель ещё загружается или упала. Попробуй <code>#model code</code>.",
+            parse_mode="HTML",
+        )
+        await state.update_data(agent_running=False)
+        return
+    except asyncio.TimeoutError:
+        await status_msg.edit_text(
+            "⚠️ <b>Таймаут</b> — модель не ответила за 300 с.\n"
+            "Попробуй снова или переключи на более быструю: <code>#model code</code>",
+            parse_mode="HTML",
+        )
+        await state.update_data(agent_running=False)
+        return
+    except Exception as e:
+        LOG.exception("LLM call error in _agent_step")
+        await status_msg.edit_text(
+            f"⚠️ Ошибка: <code>{_html.escape(str(e)[:400])}</code>",
+            parse_mode="HTML",
+        )
+        await state.update_data(agent_running=False)
+        return
+
+    data = await state.get_data()
+    if data.get("agent_token", "") != cancel_token:
+        try:
+            await status_msg.delete()
+        except Exception:
+            pass
+        return
+
+    asst_msg: dict = {"role": "assistant", "content": text}
+    if tool_calls:
+        asst_msg["tool_calls"] = [
+            {
+                "id":       tc["id"],
+                "type":     "function",
+                "function": {"name": tc["name"], "arguments": json.dumps(tc["args"])},
+            }
+            for tc in tool_calls
+        ]
+    next_messages = agent_messages + [asst_msg]
+
+    if not tool_calls:
+        await add_msg(_d, sid, "assistant", text)
+        await state.update_data(agent_running=False)
+
+        history = await get_session_msgs(_d, sid)
+        ctx_footer = f'\n<code>— {fmt_ctx(history, model_key)}</code>'
+        response_html = (to_html(text) if text else "(empty response)") + ctx_footer
+        chunks = chunk_text(response_html)
+
+        async def send_chunks(delete_status: bool):
+            if delete_status:
+                try:
+                    await status_msg.delete()
+                except Exception:
+                    pass
+            for i, chunk in enumerate(chunks):
+                kb = SESSION_KB if i == len(chunks) - 1 else None
+                try:
+                    await _b.send_message(chat_id, chunk, parse_mode="HTML", reply_markup=kb)
+                except Exception:
+                    await _b.send_message(chat_id, chunk, reply_markup=kb)
+
+        if thinking:
+            think_short = thinking[:1200] + ("…" if len(thinking) > 1200 else "")
+            try:
+                await status_msg.edit_text(
+                    f"<tg-spoiler>{_html.escape(think_short)}</tg-spoiler>",
+                    parse_mode="HTML",
+                )
+                await send_chunks(delete_status=False)
+            except Exception:
+                await send_chunks(delete_status=True)
+        elif len(chunks) == 1:
+            try:
+                await status_msg.edit_text(chunks[0], parse_mode="HTML")
+            except Exception:
+                await send_chunks(delete_status=True)
+        else:
+            await send_chunks(delete_status=True)
+
+        tokens = estimate_tokens([{"role": "system", "content": SYSTEM_PROMPT}] + history)
+        limit, warn_at, compress_at = ctx_limits(model_key)
+        if tokens >= compress_at:
+            try:
+                pct = int(tokens * 100 / limit)
+                await _b.send_message(chat_id, f"⚠️ Контекст {pct}% — авто-сжатие…")
+                count, _ = await _auto_compress(_d, sid, model_key)
+                new_history = await get_session_msgs(_d, sid)
+                await _b.send_message(
+                    chat_id,
+                    f"Сжато {count} сообщений → 1. "
+                    f"<code>— {fmt_ctx(new_history, model_key)}</code>",
+                    parse_mode="HTML",
+                )
+            except Exception as ce:
+                await _b.send_message(chat_id, f"⚠️ Авто-сжатие не удалось: {_html.escape(str(ce))}", parse_mode="HTML")
+        elif tokens >= warn_at:
+            pct = int(tokens * 100 / limit)
+            await _b.send_message(chat_id, f"⚠️ Контекст {pct}% — используй #compact")
+        return
+
+    if thinking:
+        think_short = thinking[:500] + ("…" if len(thinking) > 500 else "")
+        try:
+            await status_msg.edit_text(
+                f"💭 <tg-spoiler>{_html.escape(think_short)}</tg-spoiler>",
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+    elif text:
+        try:
+            await status_msg.edit_text(to_html(text) or "…", parse_mode="HTML")
+        except Exception:
+            pass
+    else:
+        try:
+            await status_msg.delete()
+        except Exception:
+            pass
+
+    if allow_all:
+        auto_tcs = tool_calls
+        perm_tcs = []
+    else:
+        auto_tcs = [tc for tc in tool_calls if tc["name"] in AUTO_APPROVE_TOOLS]
+        perm_tcs = [tc for tc in tool_calls if tc["name"] not in AUTO_APPROVE_TOOLS]
+
+    for tc in auto_tcs:
+        out      = await exec_tool(tc["name"], tc["args"])
+        args_str = _fmt_args(tc["name"], tc["args"])
+        short    = out[:500] + ("…" if len(out) > 500 else "")
+        try:
+            await _b.send_message(
+                chat_id,
+                f"<b>{_html.escape(tc['name'])}</b> "
+                f"<code>{_html.escape(args_str[:120])}</code>\n"
+                f"<pre>{_html.escape(short)}</pre>",
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+        next_messages.append({
+            "role":         "tool",
+            "tool_call_id": tc["id"],
+            "name":         tc["name"],
+            "content":      out,
+        })
+
+    if not perm_tcs:
+        await _agent_step(
+            chat_id, sid, model_key, next_messages,
+            turn + 1, allow_all, cancel_token, state,
+            bot=_b, db=_d,
+        )
+        return
+
+    tools_desc = "\n".join(
+        f"• <b>{_html.escape(tc['name'])}</b>: "
+        f"<code>{_html.escape(_fmt_args(tc['name'], tc['args'])[:200])}</code>"
+        for tc in perm_tcs
+    )
+    perm_text = f"<b>Permission needed:</b>\n{tools_desc}"
+
+    await state.update_data(
+        agent_messages  = next_messages,
+        agent_pending   = perm_tcs,
+        agent_turn      = turn + 1,
+        agent_allow_all = allow_all,
+        agent_token     = cancel_token,
+    )
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="Allow",     callback_data="ta:allow"),
+        InlineKeyboardButton(text="Allow All", callback_data="ta:allow_all"),
+        InlineKeyboardButton(text="Deny",      callback_data="ta:deny"),
+    ]])
+    await _b.send_message(chat_id, perm_text, parse_mode="HTML", reply_markup=kb)
+
+
+# ── Handlers ──────────────────────────────────────────────────────────────────
+
+@dp.message(Command("start"))
+async def cmd_start(msg: Message, state: FSMContext):
+    uid  = msg.from_user.id
+    name = msg.from_user.username or msg.from_user.full_name or str(uid)
+    await ensure_user(_db, uid, name)
+    user = await get_user(_db, uid)
+    remaining = _ban_remaining(user.get("ban_until"))
+    if remaining is not None:
+        mins = int(remaining.total_seconds() // 60) + 1
+        await msg.answer(f"🚫 Too many failed attempts. Try again in {mins} min.")
+        return
+    if user["authed"]:
+        await state.set_state(S.main)
+        await msg.answer("👋 Main menu", reply_markup=MAIN_KB)
+    else:
+        if user.get("ban_until"):
+            await clear_ban(_db, uid)
+        await state.set_state(S.auth)
+        await msg.answer("🔐 Send your access key:")
+
+
+@dp.message(StateFilter(S.auth))
+async def handle_auth(msg: Message, state: FSMContext):
+    uid = msg.from_user.id
+    await ensure_user(_db, uid, "")
+    user = await get_user(_db, uid)
+
+    remaining = _ban_remaining(user.get("ban_until"))
+    if remaining is not None:
+        mins = int(remaining.total_seconds() // 60) + 1
+        await msg.answer(f"🚫 Locked out. Try again in {mins} min.")
+        return
+
+    if user.get("ban_until"):
+        await clear_ban(_db, uid)
+        user = await get_user(_db, uid)
+
+    key  = (msg.text or "").strip()
+    keys = load_valid_keys()
+    if key in keys:
+        key_name = keys[key]
+        await _db.execute(
+            "UPDATE users SET authed=1, fails=0, ban_until=NULL, key_name=? WHERE uid=?",
+            (key_name, uid),
+        )
+        await _db.commit()
+        await state.set_state(S.main)
+        await msg.answer(
+            f"✅ Access granted! You are: <b>{_html.escape(key_name)}</b>",
+            parse_mode="HTML", reply_markup=MAIN_KB,
+        )
+    else:
+        fails = user["fails"] + 1
+        if fails >= MAX_FAILS:
+            await set_ban(_db, uid)
+            await msg.answer(f"🚫 Too many wrong attempts. Try again in {BAN_MINUTES} minutes.")
+        else:
+            await _db.execute("UPDATE users SET fails=? WHERE uid=?", (fails, uid))
+            await _db.commit()
+            await msg.answer(f"❌ Wrong key. {MAX_FAILS - fails} attempt(s) remaining.")
+
+
+@dp.message(StateFilter(S.main), F.text == "+ New Session")
+async def new_session(msg: Message, state: FSMContext):
+    if not await guard(msg, state):
+        return
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(
+                text=f"{v['label']}{' 🔧' if v.get('tools') else ''}",
+                callback_data=f"ns:{k}",
+            )]
+            for k, v in MODELS.items()
+        ]
+    )
+    await msg.answer("Choose model:", reply_markup=kb)
+
+
+@dp.callback_query(F.data.startswith("ns:"))
+async def new_session_model(cb: CallbackQuery, state: FSMContext):
+    if not await guard_cb(cb, state):
+        return
+    uid       = cb.from_user.id
+    user      = await get_user(_db, uid)
+    key_name  = user.get("key_name") or ""
+    model_key = cb.data.split(":", 1)[1]
+    sid       = uuid.uuid4().hex[:8]
+    title     = f"Session {datetime.now().strftime('%d.%m %H:%M')}"
+    await _db.execute(
+        "INSERT INTO sessions (id,uid,title,model,key_name) VALUES (?,?,?,?,?)",
+        (sid, uid, title, model_key, key_name),
+    )
+    await _db.commit()
+    await state.set_state(S.session)
+    await state.update_data(sid=sid, model=model_key, key_name=key_name,
+                             allow_all=False, agent_running=False, agent_token="")
+    try:
+        await sync_session_file(_db, sid)
+    except Exception:
+        pass
+    label = MODELS.get(model_key, {}).get("label", model_key)
+    tool_note = " · tools" if MODELS.get(model_key, {}).get("tools") else " · chat only"
+    await cb.message.edit_text(
+        f"<b>{_html.escape(label)}</b>{tool_note}"
+        + (f" · <b>{_html.escape(key_name)}</b>" if key_name else "") +
+        f"\n<code>{sid}</code>\n\n"
+        "Пишите сообщение или <code>#help</code> для команд.",
+        parse_mode="HTML",
+    )
+    await cb.message.answer("Session started.", reply_markup=SESSION_KB)
+    await cb.answer()
+
+
+@dp.message(StateFilter(S.main), F.text == "≡ Sessions")
+async def sessions_list(msg: Message, state: FSMContext):
+    if not await guard(msg, state):
+        return
+    uid  = msg.from_user.id
+    user = await get_user(_db, uid)
+    await _send_sessions_list(msg, uid, user.get("key_name") or "")
+
+
+@dp.callback_query(F.data.startswith("os:"))
+async def open_session_cb(cb: CallbackQuery, state: FSMContext):
+    if not await guard_cb(cb, state):
+        return
+    uid  = cb.from_user.id
+    sid  = cb.data.split(":", 1)[1]
+    sess = await get_session(_db, sid)
+    if not sess or sess["uid"] != uid:
+        await cb.answer("Session not found.", show_alert=True)
+        return
+    model_key = sess["model"]
+    if sess["status"] != "active":
+        await _db.execute("UPDATE sessions SET status='active' WHERE id=?", (sid,))
+        await _db.commit()
+    await state.set_state(S.session)
+    await state.update_data(sid=sid, model=model_key,
+                             allow_all=False, agent_running=False, agent_token="")
+    history = await get_session_msgs(_db, sid)
+    label   = MODELS.get(model_key, {}).get("label", model_key)
+    await cb.message.answer(
+        f"<b>{_html.escape(sess['title'])}</b> — {_html.escape(label)}\n"
+        f"ID: <code>{sid}</code> | Messages: {len(history)}\n"
+        f"Context: {fmt_ctx(history, model_key)}",
+        reply_markup=SESSION_KB, parse_mode="HTML",
+    )
+    await cb.answer("Opened")
+
+
+@dp.callback_query(F.data.startswith("ds:"))
+async def delete_session_ask(cb: CallbackQuery, state: FSMContext):
+    uid  = cb.from_user.id
+    sid  = cb.data.split(":", 1)[1]
+    sess = await get_session(_db, sid)
+    if not sess or sess["uid"] != uid:
+        await cb.answer("Session not found.", show_alert=True)
+        return
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ Delete", callback_data=f"dc:{sid}"),
+        InlineKeyboardButton(text="Cancel",    callback_data=f"dl:{sid}"),
+    ]])
+    await cb.message.answer(
+        f"Delete session <b>{_html.escape(sess['title'])}</b> [{sid}]?\nAll messages will be removed.",
+        parse_mode="HTML", reply_markup=kb,
+    )
+    await cb.answer()
+
+
+@dp.callback_query(F.data.startswith("dc:"))
+async def delete_session_confirm(cb: CallbackQuery, state: FSMContext):
+    uid  = cb.from_user.id
+    sid  = cb.data.split(":", 1)[1]
+    sess = await get_session(_db, sid)
+    if not sess or sess["uid"] != uid:
+        await cb.answer("Session not found.", show_alert=True)
+        return
+    await _db.execute("DELETE FROM msgs WHERE sid=?", (sid,))
+    await _db.execute("DELETE FROM sessions WHERE id=?", (sid,))
+    await _db.commit()
+    delete_session_file(sid)
+    await cb.message.edit_text(f"Session [{sid}] deleted.")
+    user = await get_user(_db, uid)
+    await _send_sessions_list(cb.message, uid, user.get("key_name") or "")
+    await cb.answer("Deleted")
+
+
+@dp.callback_query(F.data.startswith("dl:"))
+async def delete_session_cancel(cb: CallbackQuery, state: FSMContext):
+    await cb.message.delete()
+    await cb.answer("Cancelled")
+
+
+@dp.callback_query(F.data.startswith("ta:"))
+async def tool_permission_cb(cb: CallbackQuery, state: FSMContext):
+    if not await guard_cb(cb, state):
+        return
+    action   = cb.data.split(":", 1)[1]
+    chat_id  = cb.message.chat.id
+    data     = await state.get_data()
+
+    sid            = data.get("sid", "")
+    model_key      = data.get("model", DEFAULT_MODEL)
+    agent_messages = data.get("agent_messages", [])
+    pending        = data.get("agent_pending", [])
+    turn           = data.get("agent_turn", 0)
+    allow_all      = data.get("agent_allow_all", False)
+    cancel_token   = data.get("agent_token", "")
+
+    if not pending:
+        await cb.answer("No pending tools.", show_alert=True)
+        return
+
+    try:
+        await cb.message.delete()
+    except Exception:
+        pass
+    await cb.answer()
+
+    if action == "deny":
+        result_messages = list(agent_messages)
+        for tc in pending:
+            result_messages.append({
+                "role":         "tool",
+                "tool_call_id": tc["id"],
+                "name":         tc["name"],
+                "content":      "[Tool execution denied by user]",
+            })
+        await _bot.send_message(chat_id, "Tool denied. Continuing…")
+        await _agent_step(
+            chat_id, sid, model_key, result_messages,
+            turn, allow_all, cancel_token, state,
+        )
+        return
+
+    if action == "allow_all":
+        allow_all = True
+        await state.update_data(allow_all=True)
+
+    result_messages = list(agent_messages)
+    for tc in pending:
+        out      = await exec_tool(tc["name"], tc["args"])
+        args_str = _fmt_args(tc["name"], tc["args"])
+        short    = out[:600] + ("…" if len(out) > 600 else "")
+        try:
+            await _bot.send_message(
+                chat_id,
+                f"✅ <b>{_html.escape(tc['name'])}</b> "
+                f"<code>{_html.escape(args_str[:120])}</code>\n"
+                f"<pre>{_html.escape(short)}</pre>",
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+        result_messages.append({
+            "role":         "tool",
+            "tool_call_id": tc["id"],
+            "name":         tc["name"],
+            "content":      out,
+        })
+
+    try:
+        await _agent_step(
+            chat_id, sid, model_key, result_messages,
+            turn, allow_all, cancel_token, state,
+        )
+    except Exception as e:
+        LOG.exception("Unhandled error in _agent_step (tool_permission_cb)")
+        await state.update_data(agent_running=False)
+        try:
+            await _bot.send_message(
+                chat_id,
+                f"⚠️ Ошибка агента:\n<code>{_html.escape(str(e)[:500])}</code>\n\nАгент остановлен.",
+                parse_mode="HTML", reply_markup=SESSION_KB,
+            )
+        except Exception:
+            pass
+
+
+@dp.message(StateFilter(S.main), F.text == "? Help")
+async def help_cmd(msg: Message, state: FSMContext):
+    await msg.answer(
+        "<b>QwenBot</b> — AI-агент с инструментами, работающий прямо на сервере\n\n"
+        "<b>Главное меню:</b>\n"
+        "• <b>+ New Session</b> — создать новую сессию (выбор модели)\n"
+        "• <b>≡ Sessions</b> — список сессий, открыть или удалить\n"
+        "• <b>? Help</b> — эта справка\n\n"
+        "<b>Внутри сессии:</b>\n"
+        "• <b>Clear</b> — очистить историю сообщений\n"
+        "• <b>Close Session</b> — закрыть сессию (история сохраняется)\n"
+        "• <b>← Menu</b> — вернуться в главное меню\n\n"
+        + SESSION_CMD_HELP +
+        "\n\n<b>Модели:</b>\n"
+        "• <code>code</code> — Qwen3.5-4B, быстрый, инструменты, идеален для кода\n"
+        "• <code>large</code> — Qwen3.6-35B, умнее, медленнее, инструменты\n"
+        "• <code>small</code> — Qwen3.5-0.8B, минимальный, только чат\n\n"
+        "<b>Как работают инструменты:</b>\n"
+        "Агент сам решает, когда запустить инструмент. "
+        "<code>read_file</code>, <code>list_dir</code>, <code>search</code> — выполняются автоматически. "
+        "<code>bash</code> и <code>write_file</code> — запрашивают разрешение "
+        "(Allow / Allow All / Deny).\n"
+        "Используй <code>#autorun</code> чтобы отключить диалоги разрешений.\n\n"
+        "<b>Контекстное окно:</b> зависит от модели (code: 40k, large: 90k, small: 25k) · "
+        "предупреждение при 80% · авто-сжатие при 90%",
+        parse_mode="HTML", reply_markup=MAIN_KB,
+    )
+
+
+@dp.message(StateFilter(S.session), F.text == "← Menu")
+async def session_back(msg: Message, state: FSMContext):
+    await state.set_state(S.main)
+    await msg.answer("Main menu", reply_markup=MAIN_KB)
+
+
+@dp.message(StateFilter(S.session), F.text == "Close Session")
+async def session_close(msg: Message, state: FSMContext):
+    data = await state.get_data()
+    sid  = data.get("sid")
+    if sid:
+        await _db.execute("UPDATE sessions SET status='closed' WHERE id=?", (sid,))
+        await _db.commit()
+    await state.set_state(S.main)
+    await msg.answer("Session closed.", reply_markup=MAIN_KB)
+
+
+@dp.message(StateFilter(S.session), F.text == "Clear")
+async def session_clear_btn(msg: Message, state: FSMContext):
+    data = await state.get_data()
+    sid  = data.get("sid")
+    if sid:
+        await _db.execute("DELETE FROM msgs WHERE sid=?", (sid,))
+        await _db.commit()
+        try:
+            await sync_session_file(_db, sid)
+        except Exception:
+            pass
+    await msg.answer("History cleared.", reply_markup=SESSION_KB)
+
+
+@dp.message(StateFilter(S.session))
+async def session_msg(msg: Message, state: FSMContext):
+    if not await guard(msg, state):
+        return
+    data      = await state.get_data()
+    sid       = data.get("sid")
+    model_key = data.get("model", DEFAULT_MODEL)
+    text      = (msg.text or "").strip()
+    if not sid or not text:
+        return
+
+    if text.startswith("/") or text.startswith("#"):
+        parts   = text[1:].split(None, 1)
+        cmd     = "/" + parts[0].lower()
+        args    = parts[1] if len(parts) > 1 else ""
+        handler = SESSION_COMMANDS.get(cmd)
+        if handler:
+            await handler(msg, args, _db, sid, model_key, state)
+            return
+        elif text.startswith("/"):
+            pass
+
+    if data.get("agent_running"):
+        await msg.answer(
+            "⏳ Agent is still working. Use /cancel to stop it.",
+            reply_markup=SESSION_KB,
+        )
+        return
+
+    err = await check_model_available(model_key)
+    if err:
+        await msg.answer(
+            f"⚠️ {_html.escape(err)}\n\nSwitch model: /model code",
+            parse_mode="HTML", reply_markup=SESSION_KB,
+        )
+        return
+
+    cancel_token = uuid.uuid4().hex
+    await state.update_data(agent_running=True, agent_token=cancel_token)
+
+    await add_msg(_db, sid, "user", text)
+    history = await get_session_msgs(_db, sid)
+
+    if len(history) == 1:
+        raw = text.strip()
+        if len(raw) > 48:
+            cut = raw[:48].rfind(' ')
+            raw = (raw[:cut] if cut > 20 else raw[:48]) + '…'
+        await _db.execute("UPDATE sessions SET title=? WHERE id=?", (raw, sid))
+        await _db.commit()
+
+    agent_messages = [{"role": "system", "content": SYSTEM_PROMPT}] + history
+    allow_all      = data.get("allow_all", False)
+
+    tokens = estimate_tokens(agent_messages)
+    limit, warn_at, compress_at = ctx_limits(model_key)
+    if tokens >= compress_at:
+        await msg.answer(
+            f"⚠️ Контекст {int(tokens*100/limit)}% — сначала сжимаю…",
+            reply_markup=SESSION_KB,
+        )
+        try:
+            count, _ = await _auto_compress(_db, sid, model_key)
+            new_history = await get_session_msgs(_db, sid)
+            agent_messages = [{"role": "system", "content": SYSTEM_PROMPT}] + new_history
+            await msg.answer(
+                f"Сжато {count} сообщений → 1. <code>— {fmt_ctx(new_history, model_key)}</code>",
+                parse_mode="HTML",
+            )
+        except Exception as ce:
+            await msg.answer(f"⚠️ Авто-сжатие не удалось: {_html.escape(str(ce))}", parse_mode="HTML")
+
+    try:
+        await _agent_step(
+            msg.chat.id, sid, model_key,
+            agent_messages, 0, allow_all, cancel_token, state,
+        )
+    except Exception as e:
+        LOG.exception("Unhandled error in _agent_step")
+        await state.update_data(agent_running=False)
+        try:
+            await _bot.send_message(
+                msg.chat.id,
+                f"⚠️ Необработанная ошибка агента:\n<code>{_html.escape(str(e)[:500])}</code>\n\n"
+                f"Агент остановлен. Можешь продолжить.",
+                parse_mode="HTML", reply_markup=SESSION_KB,
+            )
+        except Exception:
+            pass
+
+
+@dp.message()
+async def fallback(msg: Message, state: FSMContext):
+    if not await guard(msg, state):
+        return
+    await state.set_state(S.main)
+    await msg.answer("Use the menu.", reply_markup=MAIN_KB)
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
 async def main():
     logging.basicConfig(
         level=logging.INFO,
@@ -874,788 +1661,17 @@ async def main():
         stream=sys.stdout,
         force=True,
     )
-
-    db  = await init_db()
+    global _db, _bot
+    _db = await init_db()
     _tg_session = AiohttpSession()
     _tg_session._connector_init["resolver"] = _TGResolver()
-    bot = Bot(token=BOT_TOKEN, session=_tg_session)
-    dp  = Dispatcher(storage=MemoryStorage())
-
-    # ── Guards ──────────────────────────────────────────────────────────────
-    async def guard(msg: Message, state: FSMContext) -> bool:
-        uid  = msg.from_user.id
-        name = msg.from_user.username or msg.from_user.full_name or str(uid)
-        await ensure_user(db, uid, name)
-        user = await get_user(db, uid)
-        remaining = _ban_remaining(user.get("ban_until"))
-        if remaining is not None:
-            mins = int(remaining.total_seconds() // 60) + 1
-            await msg.answer(f"🚫 Too many failed attempts. Try again in {mins} min.")
-            return False
-        if not user["authed"]:
-            if user.get("ban_until"):
-                await clear_ban(db, uid)
-            await state.set_state(S.auth)
-            await msg.answer("🔐 Send your access key:")
-            return False
-        return True
-
-    async def guard_cb(cb: CallbackQuery, state: FSMContext) -> bool:
-        uid  = cb.from_user.id
-        name = cb.from_user.username or cb.from_user.full_name or str(uid)
-        await ensure_user(db, uid, name)
-        user = await get_user(db, uid)
-        remaining = _ban_remaining(user.get("ban_until"))
-        if remaining is not None:
-            mins = int(remaining.total_seconds() // 60) + 1
-            await cb.answer(f"🚫 Too many failed attempts. Try again in {mins} min.", show_alert=True)
-            return False
-        if not user["authed"]:
-            if user.get("ban_until"):
-                await clear_ban(db, uid)
-            await state.set_state(S.auth)
-            await cb.answer("🔐 Please send /start to authenticate.", show_alert=True)
-            return False
-        return True
-
-    # ── Agent step ──────────────────────────────────────────────────────────
-    async def _agent_step(
-        chat_id: int,
-        sid: str,
-        model_key: str,
-        agent_messages: list,
-        turn: int,
-        allow_all: bool,
-        cancel_token: str,
-        state: FSMContext,
-    ):
-        """One iteration of the agent loop. Calls itself (or waits for callback) until done."""
-
-        # Check cancellation
-        data = await state.get_data()
-        if data.get("agent_token", "") != cancel_token:
-            return
-
-        if turn >= MAX_AGENT_TURNS:
-            await bot.send_message(chat_id, f"⚠️ Reached max {MAX_AGENT_TURNS} turns. Stopping.", reply_markup=SESSION_KB)
-            await state.update_data(agent_running=False)
-            return
-
-        status_msg = await bot.send_message(chat_id, "⏳")
-        last_display = [""]
-
-        async def on_thinking(think: str):
-            short   = (think[-400:] + "…") if len(think) > 400 else think
-            display = f"💭 <tg-spoiler>{_html.escape(short)}</tg-spoiler>"
-            if display != last_display[0]:
-                last_display[0] = display
-                try:
-                    await status_msg.edit_text(display, parse_mode="HTML")
-                except Exception:
-                    pass
-
-        async def on_text(text: str):
-            display = to_html(text[-3800:] if len(text) > 3800 else text) or "⏳"
-            if display != last_display[0]:
-                last_display[0] = display
-                try:
-                    await status_msg.edit_text(display, parse_mode="HTML")
-                except Exception:
-                    pass
-
-        # ── LLM call ────────────────────────────────────────────────────────
-        try:
-            thinking, text, tool_calls = await llm_stream_agent(
-                model_key, agent_messages, on_thinking, on_text,
-            )
-        except openai.APIStatusError as e:
-            label = MODELS.get(model_key, {}).get("label", model_key)
-            raw   = str(e.message or e).lower()
-            if e.status_code == 503:
-                err_text = (
-                    f"⚠️ <b>{_html.escape(label)}</b> ещё загружается (503).\n"
-                    f"Подожди и повтори, или переключись: <code>#model code</code>"
-                )
-            elif e.status_code in (400, 413) or any(
-                w in raw for w in ("context", "too long", "length", "token", "prompt", "exceed")
-            ):
-                err_text = (
-                    f"⚠️ <b>Контекст переполнен</b> (HTTP {e.status_code}).\n"
-                    f"Используй <code>#compact</code> чтобы сжать или <code>#clear</code> чтобы очистить."
-                )
-            else:
-                err_text = (
-                    f"⚠️ API {e.status_code}: <code>{_html.escape(str(e.message or e)[:300])}</code>"
-                )
-            await status_msg.edit_text(err_text, parse_mode="HTML")
-            await state.update_data(agent_running=False)
-            return
-        except openai.APIConnectionError:
-            label = MODELS.get(model_key, {}).get("label", model_key)
-            await status_msg.edit_text(
-                f"⚠️ Нет связи с <b>{_html.escape(label)}</b>.\n"
-                f"Модель ещё загружается или упала. Попробуй <code>#model code</code>.",
-                parse_mode="HTML",
-            )
-            await state.update_data(agent_running=False)
-            return
-        except asyncio.TimeoutError:
-            await status_msg.edit_text(
-                "⚠️ <b>Таймаут</b> — модель не ответила за 300 с.\n"
-                "Попробуй снова или переключи на более быструю: <code>#model code</code>",
-                parse_mode="HTML",
-            )
-            await state.update_data(agent_running=False)
-            return
-        except Exception as e:
-            LOG.exception("LLM call error in _agent_step")
-            await status_msg.edit_text(
-                f"⚠️ Ошибка: <code>{_html.escape(str(e)[:400])}</code>",
-                parse_mode="HTML",
-            )
-            await state.update_data(agent_running=False)
-            return
-
-        # Check cancellation again after long LLM call
-        data = await state.get_data()
-        if data.get("agent_token", "") != cancel_token:
-            try:
-                await status_msg.delete()
-            except Exception:
-                pass
-            return
-
-        # Build assistant message with tool_calls field if present
-        asst_msg: dict = {"role": "assistant", "content": text}
-        if tool_calls:
-            asst_msg["tool_calls"] = [
-                {
-                    "id":       tc["id"],
-                    "type":     "function",
-                    "function": {"name": tc["name"], "arguments": json.dumps(tc["args"])},
-                }
-                for tc in tool_calls
-            ]
-        next_messages = agent_messages + [asst_msg]
-
-        # ── No tool calls: final answer ──────────────────────────────────────
-        if not tool_calls:
-            await add_msg(db, sid, "assistant", text)
-            await state.update_data(agent_running=False)
-
-            # Always append context footer to response
-            history = await get_session_msgs(db, sid)
-            ctx_footer = f'\n<code>— {fmt_ctx(history, model_key)}</code>'
-            response_html = (to_html(text) if text else "(empty response)") + ctx_footer
-            chunks = chunk_text(response_html)
-
-            async def send_chunks(delete_status: bool):
-                if delete_status:
-                    try:
-                        await status_msg.delete()
-                    except Exception:
-                        pass
-                for i, chunk in enumerate(chunks):
-                    kb = SESSION_KB if i == len(chunks) - 1 else None
-                    try:
-                        await bot.send_message(chat_id, chunk, parse_mode="HTML", reply_markup=kb)
-                    except Exception:
-                        await bot.send_message(chat_id, chunk, reply_markup=kb)
-
-            if thinking:
-                think_short = thinking[:1200] + ("…" if len(thinking) > 1200 else "")
-                try:
-                    await status_msg.edit_text(
-                        f"<tg-spoiler>{_html.escape(think_short)}</tg-spoiler>",
-                        parse_mode="HTML",
-                    )
-                    await send_chunks(delete_status=False)
-                except Exception:
-                    await send_chunks(delete_status=True)
-            elif len(chunks) == 1:
-                try:
-                    await status_msg.edit_text(chunks[0], parse_mode="HTML")
-                except Exception:
-                    await send_chunks(delete_status=True)
-            else:
-                await send_chunks(delete_status=True)
-
-            # ── Auto-compress if over limit ──────────────────────────────────
-            tokens = estimate_tokens([{"role": "system", "content": SYSTEM_PROMPT}] + history)
-            limit, warn_at, compress_at = ctx_limits(model_key)
-            if tokens >= compress_at:
-                try:
-                    pct = int(tokens * 100 / limit)
-                    await bot.send_message(chat_id, f"⚠️ Контекст {pct}% — авто-сжатие…")
-                    count, _ = await _auto_compress(db, sid, model_key)
-                    new_history = await get_session_msgs(db, sid)
-                    await bot.send_message(
-                        chat_id,
-                        f"Сжато {count} сообщений → 1. "
-                        f"<code>— {fmt_ctx(new_history, model_key)}</code>",
-                        parse_mode="HTML",
-                    )
-                except Exception as ce:
-                    await bot.send_message(chat_id, f"⚠️ Авто-сжатие не удалось: {_html.escape(str(ce))}", parse_mode="HTML")
-            elif tokens >= warn_at:
-                pct = int(tokens * 100 / limit)
-                await bot.send_message(chat_id, f"⚠️ Контекст {pct}% — используй #compact")
-            return
-
-        # ── There are tool calls ─────────────────────────────────────────────
-        # Show pre-response (thinking or text) in status message
-        if thinking:
-            think_short = thinking[:500] + ("…" if len(thinking) > 500 else "")
-            try:
-                await status_msg.edit_text(
-                    f"💭 <tg-spoiler>{_html.escape(think_short)}</tg-spoiler>",
-                    parse_mode="HTML",
-                )
-            except Exception:
-                pass
-        elif text:
-            try:
-                await status_msg.edit_text(to_html(text) or "…", parse_mode="HTML")
-            except Exception:
-                pass
-        else:
-            try:
-                await status_msg.delete()
-            except Exception:
-                pass
-
-        # Split: auto-approve vs need permission
-        if allow_all:
-            auto_tcs  = tool_calls
-            perm_tcs  = []
-        else:
-            auto_tcs  = [tc for tc in tool_calls if tc["name"] in AUTO_APPROVE_TOOLS]
-            perm_tcs  = [tc for tc in tool_calls if tc["name"] not in AUTO_APPROVE_TOOLS]
-
-        # Execute auto-approved tools
-        for tc in auto_tcs:
-            out      = await exec_tool(tc["name"], tc["args"])
-            args_str = _fmt_args(tc["name"], tc["args"])
-            short    = out[:500] + ("…" if len(out) > 500 else "")
-            try:
-                await bot.send_message(
-                    chat_id,
-                    f"<b>{_html.escape(tc['name'])}</b> "
-                    f"<code>{_html.escape(args_str[:120])}</code>\n"
-                    f"<pre>{_html.escape(short)}</pre>",
-                    parse_mode="HTML",
-                )
-            except Exception:
-                pass
-            next_messages.append({
-                "role":         "tool",
-                "tool_call_id": tc["id"],
-                "name":         tc["name"],
-                "content":      out,
-            })
-
-        if not perm_tcs:
-            # All tools executed, continue loop
-            await _agent_step(
-                chat_id, sid, model_key, next_messages,
-                turn + 1, allow_all, cancel_token, state,
-            )
-            return
-
-        # ── Need permission ──────────────────────────────────────────────────
-        # Build compact permission message
-        tools_desc = "\n".join(
-            f"• <b>{_html.escape(tc['name'])}</b>: "
-            f"<code>{_html.escape(_fmt_args(tc['name'], tc['args'])[:200])}</code>"
-            for tc in perm_tcs
-        )
-        perm_text = f"<b>Permission needed:</b>\n{tools_desc}"
-
-        # Save agent state for callback to pick up
-        await state.update_data(
-            agent_messages  = next_messages,
-            agent_pending   = perm_tcs,
-            agent_turn      = turn + 1,
-            agent_allow_all = allow_all,
-            agent_token     = cancel_token,
-        )
-
-        kb = InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="Allow",     callback_data="ta:allow"),
-            InlineKeyboardButton(text="Allow All", callback_data="ta:allow_all"),
-            InlineKeyboardButton(text="Deny",      callback_data="ta:deny"),
-        ]])
-        await bot.send_message(chat_id, perm_text, parse_mode="HTML", reply_markup=kb)
-
-    # ── /start ──────────────────────────────────────────────────────────────
-    @dp.message(Command("start"))
-    async def cmd_start(msg: Message, state: FSMContext):
-        uid  = msg.from_user.id
-        name = msg.from_user.username or msg.from_user.full_name or str(uid)
-        await ensure_user(db, uid, name)
-        user = await get_user(db, uid)
-        remaining = _ban_remaining(user.get("ban_until"))
-        if remaining is not None:
-            mins = int(remaining.total_seconds() // 60) + 1
-            await msg.answer(f"🚫 Too many failed attempts. Try again in {mins} min.")
-            return
-        if user["authed"]:
-            await state.set_state(S.main)
-            await msg.answer("👋 Main menu", reply_markup=MAIN_KB)
-        else:
-            if user.get("ban_until"):
-                await clear_ban(db, uid)
-            await state.set_state(S.auth)
-            await msg.answer("🔐 Send your access key:")
-
-    # ── Auth ─────────────────────────────────────────────────────────────────
-    @dp.message(StateFilter(S.auth))
-    async def handle_auth(msg: Message, state: FSMContext):
-        uid = msg.from_user.id
-        await ensure_user(db, uid, "")
-        user = await get_user(db, uid)
-
-        remaining = _ban_remaining(user.get("ban_until"))
-        if remaining is not None:
-            mins = int(remaining.total_seconds() // 60) + 1
-            await msg.answer(f"🚫 Locked out. Try again in {mins} min.")
-            return
-
-        if user.get("ban_until"):
-            await clear_ban(db, uid)
-            user = await get_user(db, uid)
-
-        key  = (msg.text or "").strip()
-        keys = load_valid_keys()
-        if key in keys:
-            key_name = keys[key]
-            await db.execute(
-                "UPDATE users SET authed=1, fails=0, ban_until=NULL, key_name=? WHERE uid=?",
-                (key_name, uid),
-            )
-            await db.commit()
-            await state.set_state(S.main)
-            await msg.answer(
-                f"✅ Access granted! You are: <b>{_html.escape(key_name)}</b>",
-                parse_mode="HTML", reply_markup=MAIN_KB,
-            )
-        else:
-            fails = user["fails"] + 1
-            if fails >= MAX_FAILS:
-                await set_ban(db, uid)
-                await msg.answer(f"🚫 Too many wrong attempts. Try again in {BAN_MINUTES} minutes.")
-            else:
-                await db.execute("UPDATE users SET fails=? WHERE uid=?", (fails, uid))
-                await db.commit()
-                await msg.answer(f"❌ Wrong key. {MAX_FAILS - fails} attempt(s) remaining.")
-
-    # ── Main: New Session ────────────────────────────────────────────────────
-    @dp.message(StateFilter(S.main), F.text == "+ New Session")
-    async def new_session(msg: Message, state: FSMContext):
-        if not await guard(msg, state):
-            return
-        kb = InlineKeyboardMarkup(
-            inline_keyboard=[
-                [InlineKeyboardButton(
-                    text=f"{v['label']}{' 🔧' if v.get('tools') else ''}",
-                    callback_data=f"ns:{k}",
-                )]
-                for k, v in MODELS.items()
-            ]
-        )
-        await msg.answer("Choose model:", reply_markup=kb)
-
-    @dp.callback_query(F.data.startswith("ns:"))
-    async def new_session_model(cb: CallbackQuery, state: FSMContext):
-        if not await guard_cb(cb, state):
-            return
-        uid       = cb.from_user.id
-        user      = await get_user(db, uid)
-        key_name  = user.get("key_name") or ""
-        model_key = cb.data.split(":", 1)[1]
-        sid       = uuid.uuid4().hex[:8]
-        title     = f"Session {datetime.now().strftime('%d.%m %H:%M')}"
-        await db.execute(
-            "INSERT INTO sessions (id,uid,title,model,key_name) VALUES (?,?,?,?,?)",
-            (sid, uid, title, model_key, key_name),
-        )
-        await db.commit()
-        await state.set_state(S.session)
-        await state.update_data(sid=sid, model=model_key, key_name=key_name,
-                                 allow_all=False, agent_running=False, agent_token="")
-        try:
-            await sync_session_file(db, sid)
-        except Exception:
-            pass
-        label = MODELS.get(model_key, {}).get("label", model_key)
-        tool_note = " · tools" if MODELS.get(model_key, {}).get("tools") else " · chat only"
-        await cb.message.edit_text(
-            f"<b>{_html.escape(label)}</b>{tool_note}"
-            + (f" · <b>{_html.escape(key_name)}</b>" if key_name else "") +
-            f"\n<code>{sid}</code>\n\n"
-            "Пишите сообщение или <code>#help</code> для команд.",
-            parse_mode="HTML",
-        )
-        await cb.message.answer("Session started.", reply_markup=SESSION_KB)
-        await cb.answer()
-
-    # ── Main: Sessions list ──────────────────────────────────────────────────
-    @dp.message(StateFilter(S.main), F.text == "≡ Sessions")
-    async def sessions_list(msg: Message, state: FSMContext):
-        if not await guard(msg, state):
-            return
-        uid  = msg.from_user.id
-        user = await get_user(db, uid)
-        await _send_sessions_list(msg, uid, user.get("key_name") or "")
-
-    async def _send_sessions_list(target, uid: int, key_name: str):
-        sessions = await list_user_sessions(db, uid, key_name)
-        header   = f"Sessions for <b>{_html.escape(key_name)}</b>:" if key_name else "Your sessions:"
-        if not sessions:
-            await target.answer(f"{header}\nNo sessions yet. Use + New Session.",
-                                 parse_mode="HTML", reply_markup=MAIN_KB)
-            return
-        buttons = []
-        for s in sessions:
-            icon  = "▶" if s["status"] == "active" else "○"
-            label = f"{icon} {s['title']}"
-            row   = [
-                InlineKeyboardButton(text=label,  callback_data=f"os:{s['id']}"),
-                InlineKeyboardButton(text="× del", callback_data=f"ds:{s['id']}"),
-            ]
-            buttons.append(row)
-        await target.answer(
-            header,
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
-        )
-
-    @dp.callback_query(F.data.startswith("os:"))
-    async def open_session_cb(cb: CallbackQuery, state: FSMContext):
-        if not await guard_cb(cb, state):
-            return
-        uid  = cb.from_user.id
-        sid  = cb.data.split(":", 1)[1]
-        sess = await get_session(db, sid)
-        if not sess or sess["uid"] != uid:
-            await cb.answer("Session not found.", show_alert=True)
-            return
-        model_key = sess["model"]
-        if sess["status"] != "active":
-            await db.execute("UPDATE sessions SET status='active' WHERE id=?", (sid,))
-            await db.commit()
-        await state.set_state(S.session)
-        await state.update_data(sid=sid, model=model_key,
-                                 allow_all=False, agent_running=False, agent_token="")
-        history = await get_session_msgs(db, sid)
-        label   = MODELS.get(model_key, {}).get("label", model_key)
-        await cb.message.answer(
-            f"<b>{_html.escape(sess['title'])}</b> — {_html.escape(label)}\n"
-            f"ID: <code>{sid}</code> | Messages: {len(history)}\n"
-            f"Context: {fmt_ctx(history, model_key)}",
-            reply_markup=SESSION_KB, parse_mode="HTML",
-        )
-        await cb.answer("Opened")
-
-    # ── Delete session ───────────────────────────────────────────────────────
-    @dp.callback_query(F.data.startswith("ds:"))
-    async def delete_session_ask(cb: CallbackQuery, state: FSMContext):
-        uid  = cb.from_user.id
-        sid  = cb.data.split(":", 1)[1]
-        sess = await get_session(db, sid)
-        if not sess or sess["uid"] != uid:
-            await cb.answer("Session not found.", show_alert=True)
-            return
-        kb = InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="✅ Delete", callback_data=f"dc:{sid}"),
-            InlineKeyboardButton(text="Cancel", callback_data=f"dl:{sid}"),
-        ]])
-        await cb.message.answer(
-            f"Delete session <b>{_html.escape(sess['title'])}</b> [{sid}]?\nAll messages will be removed.",
-            parse_mode="HTML", reply_markup=kb,
-        )
-        await cb.answer()
-
-    @dp.callback_query(F.data.startswith("dc:"))
-    async def delete_session_confirm(cb: CallbackQuery, state: FSMContext):
-        uid  = cb.from_user.id
-        sid  = cb.data.split(":", 1)[1]
-        sess = await get_session(db, sid)
-        if not sess or sess["uid"] != uid:
-            await cb.answer("Session not found.", show_alert=True)
-            return
-        await db.execute("DELETE FROM msgs WHERE sid=?", (sid,))
-        await db.execute("DELETE FROM sessions WHERE id=?", (sid,))
-        await db.commit()
-        delete_session_file(sid)
-        await cb.message.edit_text(f"Session [{sid}] deleted.")
-        user = await get_user(db, uid)
-        await _send_sessions_list(cb.message, uid, user.get("key_name") or "")
-        await cb.answer("Deleted")
-
-    @dp.callback_query(F.data.startswith("dl:"))
-    async def delete_session_cancel(cb: CallbackQuery, state: FSMContext):
-        await cb.message.delete()
-        await cb.answer("Cancelled")
-
-    # ── Tool permission callback ─────────────────────────────────────────────
-    @dp.callback_query(F.data.startswith("ta:"))
-    async def tool_permission_cb(cb: CallbackQuery, state: FSMContext):
-        if not await guard_cb(cb, state):
-            return
-        action   = cb.data.split(":", 1)[1]  # allow | allow_all | deny
-        chat_id  = cb.message.chat.id
-        data     = await state.get_data()
-
-        sid            = data.get("sid", "")
-        model_key      = data.get("model", DEFAULT_MODEL)
-        agent_messages = data.get("agent_messages", [])
-        pending        = data.get("agent_pending", [])
-        turn           = data.get("agent_turn", 0)
-        allow_all      = data.get("agent_allow_all", False)
-        cancel_token   = data.get("agent_token", "")
-
-        if not pending:
-            await cb.answer("No pending tools.", show_alert=True)
-            return
-
-        try:
-            await cb.message.delete()
-        except Exception:
-            pass
-        await cb.answer()
-
-        if action == "deny":
-            # Tell model all tools were denied
-            result_messages = list(agent_messages)
-            for tc in pending:
-                result_messages.append({
-                    "role":         "tool",
-                    "tool_call_id": tc["id"],
-                    "name":         tc["name"],
-                    "content":      "[Tool execution denied by user]",
-                })
-            await bot.send_message(chat_id, "Tool denied. Continuing…")
-            await _agent_step(
-                chat_id, sid, model_key, result_messages,
-                turn, allow_all, cancel_token, state,
-            )
-            return
-
-        if action == "allow_all":
-            allow_all = True
-            await state.update_data(allow_all=True)
-
-        # Execute all pending tools
-        result_messages = list(agent_messages)
-        for tc in pending:
-            out      = await exec_tool(tc["name"], tc["args"])
-            args_str = _fmt_args(tc["name"], tc["args"])
-            short    = out[:600] + ("…" if len(out) > 600 else "")
-            try:
-                await bot.send_message(
-                    chat_id,
-                    f"✅ <b>{_html.escape(tc['name'])}</b> "
-                    f"<code>{_html.escape(args_str[:120])}</code>\n"
-                    f"<pre>{_html.escape(short)}</pre>",
-                    parse_mode="HTML",
-                )
-            except Exception:
-                pass
-            result_messages.append({
-                "role":         "tool",
-                "tool_call_id": tc["id"],
-                "name":         tc["name"],
-                "content":      out,
-            })
-
-        try:
-            await _agent_step(
-                chat_id, sid, model_key, result_messages,
-                turn, allow_all, cancel_token, state,
-            )
-        except Exception as e:
-            LOG.exception("Unhandled error in _agent_step (tool_permission_cb)")
-            await state.update_data(agent_running=False)
-            try:
-                await bot.send_message(
-                    chat_id,
-                    f"⚠️ Ошибка агента:\n<code>{_html.escape(str(e)[:500])}</code>\n\nАгент остановлен.",
-                    parse_mode="HTML", reply_markup=SESSION_KB,
-                )
-            except Exception:
-                pass
-
-    # ── Main: Help ───────────────────────────────────────────────────────────
-    @dp.message(StateFilter(S.main), F.text == "? Help")
-    async def help_cmd(msg: Message, state: FSMContext):
-        await msg.answer(
-            "<b>QwenBot</b> — AI-агент с инструментами, работающий прямо на сервере\n\n"
-            "<b>Главное меню:</b>\n"
-            "• <b>+ New Session</b> — создать новую сессию (выбор модели)\n"
-            "• <b>≡ Sessions</b> — список сессий, открыть или удалить\n"
-            "• <b>? Help</b> — эта справка\n\n"
-            "<b>Внутри сессии:</b>\n"
-            "• <b>Clear</b> — очистить историю сообщений\n"
-            "• <b>Close Session</b> — закрыть сессию (история сохраняется)\n"
-            "• <b>← Menu</b> — вернуться в главное меню\n\n"
-            + SESSION_CMD_HELP +
-            "\n\n<b>Модели:</b>\n"
-            "• <code>code</code> — Qwen3.5-4B, быстрый, инструменты, идеален для кода\n"
-            "• <code>large</code> — Qwen3.6-35B, умнее, медленнее, инструменты\n"
-            "• <code>small</code> — Qwen3.5-0.8B, минимальный, только чат\n\n"
-            "<b>Как работают инструменты:</b>\n"
-            "Агент сам решает, когда запустить инструмент. "
-            "<code>read_file</code>, <code>list_dir</code>, <code>search</code> — выполняются автоматически. "
-            "<code>bash</code> и <code>write_file</code> — запрашивают разрешение "
-            "(Allow / Allow All / Deny).\n"
-            "Используй <code>#autorun</code> чтобы отключить диалоги разрешений.\n\n"
-            "<b>Контекстное окно:</b> зависит от модели (code: 40k, large: 90k, small: 25k) · "
-            "предупреждение при 80% · авто-сжатие при 90%",
-            parse_mode="HTML", reply_markup=MAIN_KB,
-        )
-
-    # ── Session: keyboard buttons ────────────────────────────────────────────
-    @dp.message(StateFilter(S.session), F.text == "← Menu")
-    async def session_back(msg: Message, state: FSMContext):
-        await state.set_state(S.main)
-        await msg.answer("Main menu", reply_markup=MAIN_KB)
-
-    @dp.message(StateFilter(S.session), F.text == "Close Session")
-    async def session_close(msg: Message, state: FSMContext):
-        data = await state.get_data()
-        sid  = data.get("sid")
-        if sid:
-            await db.execute("UPDATE sessions SET status='closed' WHERE id=?", (sid,))
-            await db.commit()
-        await state.set_state(S.main)
-        await msg.answer("Session closed.", reply_markup=MAIN_KB)
-
-    @dp.message(StateFilter(S.session), F.text == "Clear")
-    async def session_clear_btn(msg: Message, state: FSMContext):
-        data = await state.get_data()
-        sid  = data.get("sid")
-        if sid:
-            await db.execute("DELETE FROM msgs WHERE sid=?", (sid,))
-            await db.commit()
-            try:
-                await sync_session_file(db, sid)
-            except Exception:
-                pass
-        await msg.answer("History cleared.", reply_markup=SESSION_KB)
-
-    # ── Session: all messages ────────────────────────────────────────────────
-    @dp.message(StateFilter(S.session))
-    async def session_msg(msg: Message, state: FSMContext):
-        if not await guard(msg, state):
-            return
-        data      = await state.get_data()
-        sid       = data.get("sid")
-        model_key = data.get("model", DEFAULT_MODEL)
-        text      = (msg.text or "").strip()
-        if not sid or not text:
-            return
-
-        # ── Session commands: /cmd or #cmd syntax ──────────────────────────
-        if text.startswith("/") or text.startswith("#"):
-            parts   = text[1:].split(None, 1)
-            cmd     = "/" + parts[0].lower()
-            args    = parts[1] if len(parts) > 1 else ""
-            handler = SESSION_COMMANDS.get(cmd)
-            if handler:
-                await handler(msg, args, db, sid, model_key, state)
-                return
-            elif text.startswith("/"):
-                pass  # let unknown /commands fall through to LLM
-
-        # ── Guard: don't start new agent while one is running ──────────────
-        if data.get("agent_running"):
-            await msg.answer(
-                "⏳ Agent is still working. Use /cancel to stop it.",
-                reply_markup=SESSION_KB,
-            )
-            return
-
-        # ── Start agent loop ────────────────────────────────────────────────
-        # Quick availability check before starting
-        err = await check_model_available(model_key)
-        if err:
-            await msg.answer(
-                f"⚠️ {_html.escape(err)}\n\nSwitch model: /model code",
-                parse_mode="HTML", reply_markup=SESSION_KB,
-            )
-            return
-
-        cancel_token = uuid.uuid4().hex
-        await state.update_data(agent_running=True, agent_token=cancel_token)
-
-        await add_msg(db, sid, "user", text)
-        history = await get_session_msgs(db, sid)
-
-        # Update title from first user message
-        if len(history) == 1:
-            raw = text.strip()
-            if len(raw) > 48:
-                cut = raw[:48].rfind(' ')
-                raw = (raw[:cut] if cut > 20 else raw[:48]) + '…'
-            await db.execute("UPDATE sessions SET title=? WHERE id=?", (raw, sid))
-            await db.commit()
-
-        agent_messages = [{"role": "system", "content": SYSTEM_PROMPT}] + history
-        allow_all      = data.get("allow_all", False)
-
-        # Check context BEFORE sending to model
-        tokens = estimate_tokens(agent_messages)
-        limit, warn_at, compress_at = ctx_limits(model_key)
-        if tokens >= compress_at:
-            await msg.answer(
-                f"⚠️ Контекст {int(tokens*100/limit)}% — сначала сжимаю…",
-                reply_markup=SESSION_KB,
-            )
-            try:
-                count, _ = await _auto_compress(db, sid, model_key)
-                new_history = await get_session_msgs(db, sid)
-                agent_messages = [{"role": "system", "content": SYSTEM_PROMPT}] + new_history
-                await msg.answer(
-                    f"Сжато {count} сообщений → 1. <code>— {fmt_ctx(new_history, model_key)}</code>",
-                    parse_mode="HTML",
-                )
-            except Exception as ce:
-                await msg.answer(f"⚠️ Авто-сжатие не удалось: {_html.escape(str(ce))}", parse_mode="HTML")
-
-        try:
-            await _agent_step(
-                msg.chat.id, sid, model_key,
-                agent_messages, 0, allow_all, cancel_token, state,
-            )
-        except Exception as e:
-            LOG.exception("Unhandled error in _agent_step")
-            await state.update_data(agent_running=False)
-            try:
-                await bot.send_message(
-                    msg.chat.id,
-                    f"⚠️ Необработанная ошибка агента:\n<code>{_html.escape(str(e)[:500])}</code>\n\n"
-                    f"Агент остановлен. Можешь продолжить.",
-                    parse_mode="HTML", reply_markup=SESSION_KB,
-                )
-            except Exception:
-                pass
-
-    # ── Fallback ─────────────────────────────────────────────────────────────
-    @dp.message()
-    async def fallback(msg: Message, state: FSMContext):
-        if not await guard(msg, state):
-            return
-        await state.set_state(S.main)
-        await msg.answer("Use the menu.", reply_markup=MAIN_KB)
-
-    # ── Start polling ─────────────────────────────────────────────────────────
-    await bot.set_my_commands([BotCommand(command="start", description="Main menu")])
+    _bot = Bot(token=BOT_TOKEN, session=_tg_session)
+    await _bot.set_my_commands([BotCommand(command="start", description="Main menu")])
     LOG.info("QwenBot starting…")
     try:
-        await dp.start_polling(bot)
+        await dp.start_polling(_bot)
     finally:
-        await db.close()
+        await _db.close()
         LOG.info("QwenBot stopped.")
 
 
