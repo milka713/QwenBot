@@ -45,7 +45,29 @@ MAX_AGENT_TURNS = 40
 BASH_TIMEOUT    = 60
 TOOL_OUT_LIMIT  = 5000
 
-SESSION_DIR    = os.environ.get("SESSION_DIR",  "/opt/qwenbot/sessions")
+USERS_DIR      = os.environ.get("USERS_DIR",    "/opt/qwenbot/users")
+
+_TRANSLIT_MAP = {
+    "а":"a","б":"b","в":"v","г":"g","д":"d","е":"e","ё":"yo","ж":"zh",
+    "з":"z","и":"i","й":"y","к":"k","л":"l","м":"m","н":"n","о":"o",
+    "п":"p","р":"r","с":"s","т":"t","у":"u","ф":"f","х":"kh","ц":"ts",
+    "ч":"ch","ш":"sh","щ":"shch","ъ":"","ы":"y","ь":"","э":"e","ю":"yu","я":"ya",
+}
+
+def to_latin(name: str) -> str:
+    """Transliterate Cyrillic to Latin, keep alphanumeric and underscores."""
+    result = []
+    for ch in name.lower():
+        if ch in _TRANSLIT_MAP:
+            result.append(_TRANSLIT_MAP[ch])
+        elif ch.isascii() and (ch.isalnum() or ch in "-_"):
+            result.append(ch)
+    out = "".join(result).strip("-_")
+    return out or "user"
+
+def user_sessions_dir(key_name: str) -> str:
+    return os.path.join(USERS_DIR, to_latin(key_name), "sessions")
+
 
 def ctx_limits(model_key: str) -> tuple[int, int, int]:
     """Return (limit, warn_at, compress_at) for the given model."""
@@ -424,7 +446,7 @@ class S(StatesGroup):
 
 # ── DB ────────────────────────────────────────────────────────────────────────
 async def init_db() -> aiosqlite.Connection:
-    os.makedirs(SESSION_DIR, exist_ok=True)
+    os.makedirs(USERS_DIR, exist_ok=True)
     db = await aiosqlite.connect(DB_PATH)
     db.row_factory = aiosqlite.Row
     await db.executescript("""
@@ -663,14 +685,14 @@ async def llm_once(model_key: str, messages: list) -> str:
 
 
 # ── Session files ─────────────────────────────────────────────────────────────
-def session_file_path(sid: str, uid: int) -> str:
-    return os.path.join(SESSION_DIR, str(uid), sid, "session.json")
+def session_file_path(sid: str, key_name: str) -> str:
+    return os.path.join(user_sessions_dir(key_name), sid, "session.json")
 
 async def sync_session_file(db, sid: str):
     msgs = await get_session_msgs(db, sid)
     sess = await get_session(db, sid)
-    uid  = sess["uid"] if sess else 0
-    session_dir = os.path.join(SESSION_DIR, str(uid), sid)
+    key_name = (sess.get("key_name") or "user") if sess else "user"
+    session_dir = os.path.join(user_sessions_dir(key_name), sid)
     os.makedirs(session_dir, exist_ok=True)
     data = {
         "id":    sid,
@@ -679,11 +701,11 @@ async def sync_session_file(db, sid: str):
         "status": sess["status"] if sess else "active",
         "msgs":  msgs,
     }
-    with open(session_file_path(sid, uid), "w", encoding="utf-8") as f:
+    with open(session_file_path(sid, key_name), "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
-def delete_session_file(sid: str, uid: int):
-    session_dir = os.path.join(SESSION_DIR, str(uid), sid)
+def delete_session_file(sid: str, key_name: str):
+    session_dir = os.path.join(user_sessions_dir(key_name), sid)
     try:
         shutil.rmtree(session_dir)
     except FileNotFoundError:
@@ -1265,6 +1287,7 @@ async def handle_auth(msg: Message, state: FSMContext):
             (key_name, uid),
         )
         await _db.commit()
+        os.makedirs(user_sessions_dir(key_name), exist_ok=True)
         await state.set_state(S.main)
         await msg.answer(
             f"✅ Access granted! You are: <b>{_html.escape(key_name)}</b>",
@@ -1396,10 +1419,12 @@ async def delete_session_confirm(cb: CallbackQuery, state: FSMContext):
     if not sess or sess["uid"] != uid:
         await cb.answer("Session not found.", show_alert=True)
         return
+    sess = await get_session(_db, sid)
+    key_name = (sess.get("key_name") or "user") if sess else "user"
     await _db.execute("DELETE FROM msgs WHERE sid=?", (sid,))
     await _db.execute("DELETE FROM sessions WHERE id=?", (sid,))
     await _db.commit()
-    delete_session_file(sid, uid)
+    delete_session_file(sid, key_name)
     await cb.message.edit_text(f"Session [{sid}] deleted.")
     user = await get_user(_db, uid)
     await _send_sessions_list(cb.message, uid, user.get("key_name") or "")

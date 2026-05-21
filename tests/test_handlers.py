@@ -15,7 +15,7 @@ import bot
 @pytest.fixture
 async def db(tmp_path, monkeypatch):
     monkeypatch.setattr(bot, "DB_PATH",     str(tmp_path / "test.db"))
-    monkeypatch.setattr(bot, "SESSION_DIR", str(tmp_path / "sessions"))
+    monkeypatch.setattr(bot, "USERS_DIR", str(tmp_path / "users"))
     conn = await bot.init_db()
     await bot.ensure_user(conn, 1, "testuser")
     await conn.execute(

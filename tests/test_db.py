@@ -12,7 +12,7 @@ import bot
 @pytest.fixture
 async def db(tmp_path, monkeypatch):
     monkeypatch.setattr(bot, "DB_PATH",     str(tmp_path / "test.db"))
-    monkeypatch.setattr(bot, "SESSION_DIR", str(tmp_path / "sessions"))
+    monkeypatch.setattr(bot, "USERS_DIR", str(tmp_path / "users"))
     conn = await bot.init_db()
     yield conn
     await conn.close()
@@ -22,7 +22,7 @@ async def db(tmp_path, monkeypatch):
 
 async def test_init_db_creates_tables(tmp_path, monkeypatch):
     monkeypatch.setattr(bot, "DB_PATH",     str(tmp_path / "test.db"))
-    monkeypatch.setattr(bot, "SESSION_DIR", str(tmp_path / "sessions"))
+    monkeypatch.setattr(bot, "USERS_DIR", str(tmp_path / "users"))
     conn = await bot.init_db()
     async with conn.execute("SELECT name FROM sqlite_master WHERE type='table'") as c:
         tables = {r[0] for r in await c.fetchall()}
@@ -32,7 +32,7 @@ async def test_init_db_creates_tables(tmp_path, monkeypatch):
 
 async def test_init_db_idempotent(tmp_path, monkeypatch):
     monkeypatch.setattr(bot, "DB_PATH",     str(tmp_path / "test.db"))
-    monkeypatch.setattr(bot, "SESSION_DIR", str(tmp_path / "sessions"))
+    monkeypatch.setattr(bot, "USERS_DIR", str(tmp_path / "users"))
     c1 = await bot.init_db()
     await c1.close()
     c2 = await bot.init_db()
@@ -140,7 +140,7 @@ async def test_get_session_msgs_shape(db):
 # ── add_msg ───────────────────────────────────────────────────────────────────
 
 async def test_add_msg_persists(db, monkeypatch, tmp_path):
-    monkeypatch.setattr(bot, "SESSION_DIR", str(tmp_path / "sessions"))
+    monkeypatch.setattr(bot, "USERS_DIR", str(tmp_path / "users"))
     await bot.ensure_user(db, 700, "grace")
     await db.execute(
         "INSERT INTO sessions (id,uid,title,model) VALUES (?,?,?,?)",

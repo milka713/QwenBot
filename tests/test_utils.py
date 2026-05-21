@@ -278,10 +278,10 @@ def test_ban_remaining_invalid():
 # ── session_file_path ─────────────────────────────────────────────────────────
 
 def test_session_file_path():
-    path = bot.session_file_path("abc123", uid=42)
+    path = bot.session_file_path("abc123", key_name="admin")
     assert "abc123" in path
     assert path.endswith(".json")
-    assert "42" in path
+    assert "admin" in path
 
 
 # ── load_valid_keys ───────────────────────────────────────────────────────────
