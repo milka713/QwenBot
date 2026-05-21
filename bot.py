@@ -44,10 +44,13 @@ MAX_AGENT_TURNS = 20
 BASH_TIMEOUT    = 60
 TOOL_OUT_LIMIT  = 5000
 
-SESSION_DIR           = "/home/mark/qwenbot/sessions"
-CONTEXT_LIMIT         = 95_000
-CONTEXT_WARN_TOKENS   = 81_000   # ~85% — warn user
-CONTEXT_AUTO_COMPRESS = 90_000   # ~95% — auto-compress
+SESSION_DIR = "/home/mark/qwenbot/sessions"
+
+def ctx_limits(model_key: str) -> tuple[int, int, int]:
+    """Return (limit, warn_at, compress_at) for the given model."""
+    limit = MODELS.get(model_key, MODELS[DEFAULT_MODEL]).get("context", 90_000)
+    # Reserve 4096 for response tokens; warn at 80%, compress at 90%
+    return limit - 4096, int((limit - 4096) * 0.80), int((limit - 4096) * 0.90)
 
 def load_valid_keys() -> dict[str, str]:
     try:
@@ -75,18 +78,21 @@ MODELS = {
         "model_id": "nphearum/Qwen3.5-4BxOpus-4.6-Code-Reasoning-Full-Distilled-GGUF:Q5_K_M",
         "label":    "⚡ Qwen3.5-4B Code",
         "tools":    True,
+        "context":  40_000,   # llama-server -c 40000
     },
     "large": {
         "base_url": "http://localhost:8080/v1",
         "model_id": "mradermacher/Qwen3.6-35B-A3B-Claude-4.7-Opus-Reasoning-Distilled-i1-GGUF:IQ3_XS",
         "label":    "🧠 Qwen3.6-35B",
         "tools":    True,
+        "context":  90_000,   # llama-server -c 90000
     },
     "small": {
         "base_url": "http://localhost:8082/v1",
         "model_id": "Jackrong/Qwen3.5-0.8B-Claude-4.6-Opus-Reasoning-Distilled-GGUF:Q4_K_M",
         "label":    "🐇 Qwen3.5-0.8B",
         "tools":    False,
+        "context":  25_000,   # llama-server -c 25000
     },
 }
 DEFAULT_MODEL = "code"
@@ -125,12 +131,13 @@ def estimate_tokens(messages: list) -> int:
     """Rough estimate: ~3 chars per token (conservative for Russian/code mix)."""
     return sum(len(json.dumps(m, ensure_ascii=False)) for m in messages) // 3
 
-def fmt_ctx(history: list) -> str:
-    """Return short context summary: '4,200 / 95,000 (4%)'."""
+def fmt_ctx(history: list, model_key: str = DEFAULT_MODEL) -> str:
+    """Return short context summary: '4,200 / 86,000 (4%)'."""
     full = [{"role": "system", "content": SYSTEM_PROMPT}] + history
     tokens = estimate_tokens(full)
-    pct = int(tokens * 100 / CONTEXT_LIMIT)
-    return f"{tokens:,} / {CONTEXT_LIMIT:,} tokens ({pct}%)"
+    limit, _, _ = ctx_limits(model_key)
+    pct = int(tokens * 100 / limit)
+    return f"{tokens:,} / {limit:,} tokens ({pct}%)"
 
 SESSION_CMD_HELP = (
     "<b>Session commands</b> — prefix <code>#</code> or <code>/</code>:\n\n"
@@ -805,7 +812,7 @@ async def sc_compress(msg: Message, args: str, db, sid: str, model_key: str, sta
     new_history = await get_session_msgs(db, sid)
     await wait.edit_text(
         f"Compressed {count} messages → 1 summary. "
-        f"<code>— {fmt_ctx(new_history)}</code>\n\n"
+        f"<code>— {fmt_ctx(new_history, model_key)}</code>\n\n"
         f"<pre>{_html.escape(summary[:1000])}{'…' if len(summary) > 1000 else ''}</pre>",
         parse_mode="HTML",
     )
@@ -827,22 +834,23 @@ async def sc_status(msg: Message, args: str, db, sid: str, model_key: str, state
     msgs = await get_session_msgs(db, sid)
     full = [{"role": "system", "content": SYSTEM_PROMPT}] + msgs
     tokens = estimate_tokens(full)
-    pct = int(tokens * 100 / CONTEXT_LIMIT)
+    limit, warn_at, compress_at = ctx_limits(model_key)
+    pct = int(tokens * 100 / limit)
     filled = pct // 10
     bar = "█" * filled + "░" * (10 - filled)
     label = MODELS.get(model_key, {}).get("label", model_key)
     data  = await state.get_data()
     autorun = "ON" if data.get("allow_all") else "OFF"
     warn = ""
-    if tokens > CONTEXT_AUTO_COMPRESS:
-        warn = "\n⚠️ Context near limit — use #compact"
-    elif tokens > CONTEXT_WARN_TOKENS:
-        warn = "\n⚠️ Context at 85%+ — consider #compact"
+    if tokens >= compress_at:
+        warn = "\n⚠️ Контекст почти полный — используй #compact"
+    elif tokens >= warn_at:
+        warn = "\n⚠️ Контекст заполнен на 80%+ — рекомендуется #compact"
     await msg.answer(
         f"<b>Session status</b>\n"
         f"Model: {_html.escape(label)}\n"
         f"Messages: {len(msgs)}\n"
-        f"Context: <code>{bar}</code> {tokens:,}/{CONTEXT_LIMIT:,} ({pct}%)\n"
+        f"Context: <code>{bar}</code> {tokens:,}/{limit:,} ({pct}%)\n"
         f"Autorun: {autorun}{warn}",
         parse_mode="HTML", reply_markup=SESSION_KB,
     )
@@ -962,28 +970,48 @@ async def main():
             )
         except openai.APIStatusError as e:
             label = MODELS.get(model_key, {}).get("label", model_key)
+            raw   = str(e.message or e).lower()
             if e.status_code == 503:
                 err_text = (
-                    f"⚠️ <b>{_html.escape(label)}</b> is still loading (503).\n"
-                    f"Wait a moment and retry, or switch with /model code"
+                    f"⚠️ <b>{_html.escape(label)}</b> ещё загружается (503).\n"
+                    f"Подожди и повтори, или переключись: <code>#model code</code>"
+                )
+            elif e.status_code in (400, 413) or any(
+                w in raw for w in ("context", "too long", "length", "token", "prompt", "exceed")
+            ):
+                err_text = (
+                    f"⚠️ <b>Контекст переполнен</b> (HTTP {e.status_code}).\n"
+                    f"Используй <code>#compact</code> чтобы сжать или <code>#clear</code> чтобы очистить."
                 )
             else:
-                err_text = f"⚠️ API {e.status_code}: {_html.escape(str(e.message or e))}"
+                err_text = (
+                    f"⚠️ API {e.status_code}: <code>{_html.escape(str(e.message or e)[:300])}</code>"
+                )
             await status_msg.edit_text(err_text, parse_mode="HTML")
             await state.update_data(agent_running=False)
             return
-        except openai.APIConnectionError as e:
+        except openai.APIConnectionError:
             label = MODELS.get(model_key, {}).get("label", model_key)
             await status_msg.edit_text(
-                f"⚠️ Cannot reach <b>{_html.escape(label)}</b>.\n"
-                f"Model may be loading or crashed. Try /model code or check server.",
+                f"⚠️ Нет связи с <b>{_html.escape(label)}</b>.\n"
+                f"Модель ещё загружается или упала. Попробуй <code>#model code</code>.",
+                parse_mode="HTML",
+            )
+            await state.update_data(agent_running=False)
+            return
+        except asyncio.TimeoutError:
+            await status_msg.edit_text(
+                "⚠️ <b>Таймаут</b> — модель не ответила за 300 с.\n"
+                "Попробуй снова или переключи на более быструю: <code>#model code</code>",
                 parse_mode="HTML",
             )
             await state.update_data(agent_running=False)
             return
         except Exception as e:
+            LOG.exception("LLM call error in _agent_step")
             await status_msg.edit_text(
-                f"⚠️ Error: {_html.escape(str(e))}", parse_mode="HTML",
+                f"⚠️ Ошибка: <code>{_html.escape(str(e)[:400])}</code>",
+                parse_mode="HTML",
             )
             await state.update_data(agent_running=False)
             return
@@ -1017,7 +1045,7 @@ async def main():
 
             # Always append context footer to response
             history = await get_session_msgs(db, sid)
-            ctx_footer = f'\n<code>— {fmt_ctx(history)}</code>'
+            ctx_footer = f'\n<code>— {fmt_ctx(history, model_key)}</code>'
             response_html = (to_html(text) if text else "(empty response)") + ctx_footer
             chunks = chunk_text(response_html)
 
@@ -1054,23 +1082,24 @@ async def main():
 
             # ── Auto-compress if over limit ──────────────────────────────────
             tokens = estimate_tokens([{"role": "system", "content": SYSTEM_PROMPT}] + history)
-            if tokens >= CONTEXT_AUTO_COMPRESS:
+            limit, warn_at, compress_at = ctx_limits(model_key)
+            if tokens >= compress_at:
                 try:
-                    pct = int(tokens * 100 / CONTEXT_LIMIT)
-                    await bot.send_message(chat_id, f"⚠️ Context {pct}% — auto-compressing…")
+                    pct = int(tokens * 100 / limit)
+                    await bot.send_message(chat_id, f"⚠️ Контекст {pct}% — авто-сжатие…")
                     count, _ = await _auto_compress(db, sid, model_key)
                     new_history = await get_session_msgs(db, sid)
                     await bot.send_message(
                         chat_id,
-                        f"Compressed {count} messages → 1 summary. "
-                        f"<code>— {fmt_ctx(new_history)}</code>",
+                        f"Сжато {count} сообщений → 1. "
+                        f"<code>— {fmt_ctx(new_history, model_key)}</code>",
                         parse_mode="HTML",
                     )
                 except Exception as ce:
-                    await bot.send_message(chat_id, f"⚠️ Auto-compress failed: {_html.escape(str(ce))}", parse_mode="HTML")
-            elif tokens >= CONTEXT_WARN_TOKENS:
-                pct = int(tokens * 100 / CONTEXT_LIMIT)
-                await bot.send_message(chat_id, f"⚠️ Context {pct}% — используй #compact")
+                    await bot.send_message(chat_id, f"⚠️ Авто-сжатие не удалось: {_html.escape(str(ce))}", parse_mode="HTML")
+            elif tokens >= warn_at:
+                pct = int(tokens * 100 / limit)
+                await bot.send_message(chat_id, f"⚠️ Контекст {pct}% — используй #compact")
             return
 
         # ── There are tool calls ─────────────────────────────────────────────
@@ -1323,7 +1352,7 @@ async def main():
         await cb.message.answer(
             f"<b>{_html.escape(sess['title'])}</b> — {_html.escape(label)}\n"
             f"ID: <code>{sid}</code> | Messages: {len(history)}\n"
-            f"Context: {fmt_ctx(history)}",
+            f"Context: {fmt_ctx(history, model_key)}",
             reply_markup=SESSION_KB, parse_mode="HTML",
         )
         await cb.answer("Opened")
@@ -1440,10 +1469,22 @@ async def main():
                 "content":      out,
             })
 
-        await _agent_step(
-            chat_id, sid, model_key, result_messages,
-            turn, allow_all, cancel_token, state,
-        )
+        try:
+            await _agent_step(
+                chat_id, sid, model_key, result_messages,
+                turn, allow_all, cancel_token, state,
+            )
+        except Exception as e:
+            LOG.exception("Unhandled error in _agent_step (tool_permission_cb)")
+            await state.update_data(agent_running=False)
+            try:
+                await bot.send_message(
+                    chat_id,
+                    f"⚠️ Ошибка агента:\n<code>{_html.escape(str(e)[:500])}</code>\n\nАгент остановлен.",
+                    parse_mode="HTML", reply_markup=SESSION_KB,
+                )
+            except Exception:
+                pass
 
     # ── Main: Help ───────────────────────────────────────────────────────────
     @dp.message(StateFilter(S.main), F.text == "? Help")
@@ -1469,8 +1510,8 @@ async def main():
             "<code>bash</code> и <code>write_file</code> — запрашивают разрешение "
             "(Allow / Allow All / Deny).\n"
             "Используй <code>#autorun</code> чтобы отключить диалоги разрешений.\n\n"
-            f"<b>Контекстное окно:</b> {CONTEXT_LIMIT:,} токенов · "
-            f"предупреждение при 85% · авто-сжатие при 95%",
+            "<b>Контекстное окно:</b> зависит от модели (code: 40k, large: 90k, small: 25k) · "
+            "предупреждение при 80% · авто-сжатие при 90%",
             parse_mode="HTML", reply_markup=MAIN_KB,
         )
 
@@ -1563,10 +1604,42 @@ async def main():
         agent_messages = [{"role": "system", "content": SYSTEM_PROMPT}] + history
         allow_all      = data.get("allow_all", False)
 
-        await _agent_step(
-            msg.chat.id, sid, model_key,
-            agent_messages, 0, allow_all, cancel_token, state,
-        )
+        # Check context BEFORE sending to model
+        tokens = estimate_tokens(agent_messages)
+        limit, warn_at, compress_at = ctx_limits(model_key)
+        if tokens >= compress_at:
+            await msg.answer(
+                f"⚠️ Контекст {int(tokens*100/limit)}% — сначала сжимаю…",
+                reply_markup=SESSION_KB,
+            )
+            try:
+                count, _ = await _auto_compress(db, sid, model_key)
+                new_history = await get_session_msgs(db, sid)
+                agent_messages = [{"role": "system", "content": SYSTEM_PROMPT}] + new_history
+                await msg.answer(
+                    f"Сжато {count} сообщений → 1. <code>— {fmt_ctx(new_history, model_key)}</code>",
+                    parse_mode="HTML",
+                )
+            except Exception as ce:
+                await msg.answer(f"⚠️ Авто-сжатие не удалось: {_html.escape(str(ce))}", parse_mode="HTML")
+
+        try:
+            await _agent_step(
+                msg.chat.id, sid, model_key,
+                agent_messages, 0, allow_all, cancel_token, state,
+            )
+        except Exception as e:
+            LOG.exception("Unhandled error in _agent_step")
+            await state.update_data(agent_running=False)
+            try:
+                await bot.send_message(
+                    msg.chat.id,
+                    f"⚠️ Необработанная ошибка агента:\n<code>{_html.escape(str(e)[:500])}</code>\n\n"
+                    f"Агент остановлен. Можешь продолжить.",
+                    parse_mode="HTML", reply_markup=SESSION_KB,
+                )
+            except Exception:
+                pass
 
     # ── Fallback ─────────────────────────────────────────────────────────────
     @dp.message()
