@@ -125,19 +125,26 @@ def estimate_tokens(messages: list) -> int:
     """Rough estimate: ~3 chars per token (conservative for Russian/code mix)."""
     return sum(len(json.dumps(m, ensure_ascii=False)) for m in messages) // 3
 
+def fmt_ctx(history: list) -> str:
+    """Return short context summary: '4,200 / 95,000 (4%)'."""
+    full = [{"role": "system", "content": SYSTEM_PROMPT}] + history
+    tokens = estimate_tokens(full)
+    pct = int(tokens * 100 / CONTEXT_LIMIT)
+    return f"{tokens:,} / {CONTEXT_LIMIT:,} tokens ({pct}%)"
+
 SESSION_CMD_HELP = (
-    "<b>Session commands</b> (use <code>#cmd</code> or <code>/cmd</code>):\n"
-    "<code>#compact</code> — compress conversation to save context\n"
-    "<code>#status</code> — show context usage and model info\n"
-    "<code>#clear</code> — clear conversation history\n"
-    "<code>#undo</code> — remove last exchange\n"
-    "<code>#history [n]</code> — show last n messages (default 5)\n"
-    "<code>#model [code|large|small]</code> — show or switch model\n"
-    "<code>#export</code> — download conversation as .txt\n"
-    "<code>#add &lt;text&gt;</code> — inject context into conversation\n"
-    "<code>#autorun</code> — toggle auto-approve all tools\n"
-    "<code>#cancel</code> — stop running agent\n"
-    "<code>#help</code> — this help"
+    "<b>Session commands</b> — prefix <code>#</code> or <code>/</code>:\n\n"
+    "<code>#compact</code> — сжать историю в краткое резюме, освободив контекст\n"
+    "<code>#status</code> — показать загрузку контекста, модель, статистику\n"
+    "<code>#clear</code> — удалить все сообщения в этой сессии\n"
+    "<code>#undo</code> — убрать последний обмен (вопрос + ответ)\n"
+    "<code>#history [n]</code> — показать последние n сообщений (по умолч. 5)\n"
+    "<code>#model [code|large|small]</code> — переключить модель или показать текущую\n"
+    "<code>#export</code> — скачать переписку как .txt файл\n"
+    "<code>#add &lt;текст&gt;</code> — добавить текст в контекст как сообщение пользователя\n"
+    "<code>#autorun</code> — вкл/выкл авто-разрешение для bash и write_file\n"
+    "<code>#cancel</code> — остановить работающий агент\n"
+    "<code>#help</code> — эта справка"
 )
 
 # ── Tools ─────────────────────────────────────────────────────────────────────
@@ -1251,12 +1258,13 @@ async def main():
         except Exception:
             pass
         label = MODELS.get(model_key, {}).get("label", model_key)
-        tool_note = " · tools 🔧" if MODELS.get(model_key, {}).get("tools") else " · chat only"
+        tool_note = " · tools" if MODELS.get(model_key, {}).get("tools") else " · chat only"
         await cb.message.edit_text(
-            f"✅ <b>{_html.escape(title)}</b> — {_html.escape(label)}{tool_note}\n"
+            f"<b>{_html.escape(title)}</b> — {_html.escape(label)}{tool_note}\n"
             f"ID: <code>{sid}</code>"
             + (f" · <b>{_html.escape(key_name)}</b>" if key_name else "") +
-            "\n\nType your message or use /help for commands.",
+            f"\nContext: {fmt_ctx([])}\n\n"
+            "Type your message or use <code>#help</code> for commands.",
             parse_mode="HTML",
         )
         await cb.message.answer("Session started.", reply_markup=SESSION_KB)
@@ -1313,8 +1321,9 @@ async def main():
         history = await get_session_msgs(db, sid)
         label   = MODELS.get(model_key, {}).get("label", model_key)
         await cb.message.answer(
-            f"🔄 <b>{_html.escape(sess['title'])}</b> — {_html.escape(label)}\n"
-            f"ID: <code>{sid}</code> | Messages: {len(history)}",
+            f"<b>{_html.escape(sess['title'])}</b> — {_html.escape(label)}\n"
+            f"ID: <code>{sid}</code> | Messages: {len(history)}\n"
+            f"Context: {fmt_ctx(history)}",
             reply_markup=SESSION_KB, parse_mode="HTML",
         )
         await cb.answer("Opened")
@@ -1440,18 +1449,28 @@ async def main():
     @dp.message(StateFilter(S.main), F.text == "? Help")
     async def help_cmd(msg: Message, state: FSMContext):
         await msg.answer(
-            "<b>QwenBot</b> — AI coding assistant with tool use\n\n"
-            "<b>Main menu:</b>\n"
-            "• + New Session — start a new agent session\n"
-            "• ≡ Sessions — list and manage sessions\n\n"
+            "<b>QwenBot</b> — AI-агент с инструментами, работающий прямо на сервере\n\n"
+            "<b>Главное меню:</b>\n"
+            "• <b>+ New Session</b> — создать новую сессию (выбор модели)\n"
+            "• <b>≡ Sessions</b> — список сессий, открыть или удалить\n"
+            "• <b>? Help</b> — эта справка\n\n"
+            "<b>Внутри сессии:</b>\n"
+            "• <b>Clear</b> — очистить историю сообщений\n"
+            "• <b>Close Session</b> — закрыть сессию (история сохраняется)\n"
+            "• <b>← Menu</b> — вернуться в главное меню\n\n"
             + SESSION_CMD_HELP +
-            "\n\n<b>Models ([t] = tool use enabled):</b>\n"
-            "• [t] Qwen3.5-4B Code — fast, great for coding (port 8081)\n"
-            "• [t] Qwen3.6-35B — most capable, slower (port 8080)\n"
-            "• Qwen3.5-0.8B — tiny, very fast, chat only (port 8082)\n\n"
-            "<b>Tool use:</b>\n"
-            "Read-only tools (read_file, list_dir, search) run automatically. "
-            "bash and write_file ask for permission — or use /autorun to skip.",
+            "\n\n<b>Модели:</b>\n"
+            "• <code>code</code> — Qwen3.5-4B, быстрый, инструменты, идеален для кода\n"
+            "• <code>large</code> — Qwen3.6-35B, умнее, медленнее, инструменты\n"
+            "• <code>small</code> — Qwen3.5-0.8B, минимальный, только чат\n\n"
+            "<b>Как работают инструменты:</b>\n"
+            "Агент сам решает, когда запустить инструмент. "
+            "<code>read_file</code>, <code>list_dir</code>, <code>search</code> — выполняются автоматически. "
+            "<code>bash</code> и <code>write_file</code> — запрашивают разрешение "
+            "(Allow / Allow All / Deny).\n"
+            "Используй <code>#autorun</code> чтобы отключить диалоги разрешений.\n\n"
+            f"<b>Контекстное окно:</b> {CONTEXT_LIMIT:,} токенов · "
+            f"предупреждение при 85% · авто-сжатие при 95%",
             parse_mode="HTML", reply_markup=MAIN_KB,
         )
 
