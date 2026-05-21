@@ -213,17 +213,20 @@ async def test_exec_tool_unknown():
 
 async def test_delete_session_file_missing(tmp_path, monkeypatch):
     monkeypatch.setattr(bot, "SESSION_DIR", str(tmp_path))
-    bot.delete_session_file("nonexistent_sid")  # must not raise
+    bot.delete_session_file("nonexistent_sid", uid=1)  # must not raise
 
 
 async def test_delete_session_file_removes(tmp_path, monkeypatch):
     monkeypatch.setattr(bot, "SESSION_DIR", str(tmp_path))
-    sid  = "testsid123"
-    path = tmp_path / f"session_{sid}.json"
-    path.write_text("{}")
-    assert path.exists()
-    bot.delete_session_file(sid)
-    assert not path.exists()
+    sid = "testsid123"
+    uid = 1
+    import os
+    session_dir = tmp_path / str(uid) / sid
+    session_dir.mkdir(parents=True)
+    (session_dir / "session.json").write_text("{}")
+    assert (session_dir / "session.json").exists()
+    bot.delete_session_file(sid, uid=uid)
+    assert not session_dir.exists()
 
 
 async def test_sync_session_file_creates(tmp_path, monkeypatch):
@@ -239,7 +242,7 @@ async def test_sync_session_file_creates(tmp_path, monkeypatch):
     await bot.add_msg(db, "sid1", "user", "hello")
     await db.close()
 
-    path = Path(bot.session_file_path("sid1"))
+    path = Path(bot.session_file_path("sid1", uid=1))
     assert path.exists()
     data = json.loads(path.read_text())
     assert data["id"] == "sid1"

@@ -8,6 +8,7 @@ import logging
 import os
 import re
 import shlex
+import shutil
 import sys
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -252,7 +253,7 @@ async def exec_tool(name: str, args: dict) -> str:
             cmd = args.get("command", "")
             cwd = args.get("working_dir") or "/home/mark"
             if not os.path.isdir(str(cwd)):
-                cwd = "/home/mark"
+                cwd = os.path.expanduser("~")
             proc = await asyncio.create_subprocess_shell(
                 cmd,
                 stdout=asyncio.subprocess.PIPE,
@@ -662,13 +663,15 @@ async def llm_once(model_key: str, messages: list) -> str:
 
 
 # ── Session files ─────────────────────────────────────────────────────────────
-def session_file_path(sid: str) -> str:
-    return os.path.join(SESSION_DIR, f"session_{sid}.json")
+def session_file_path(sid: str, uid: int) -> str:
+    return os.path.join(SESSION_DIR, str(uid), sid, "session.json")
 
 async def sync_session_file(db, sid: str):
     msgs = await get_session_msgs(db, sid)
     sess = await get_session(db, sid)
-    os.makedirs(SESSION_DIR, exist_ok=True)
+    uid  = sess["uid"] if sess else 0
+    session_dir = os.path.join(SESSION_DIR, str(uid), sid)
+    os.makedirs(session_dir, exist_ok=True)
     data = {
         "id":    sid,
         "title": sess["title"] if sess else sid,
@@ -676,12 +679,13 @@ async def sync_session_file(db, sid: str):
         "status": sess["status"] if sess else "active",
         "msgs":  msgs,
     }
-    with open(session_file_path(sid), "w", encoding="utf-8") as f:
+    with open(session_file_path(sid, uid), "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
-def delete_session_file(sid: str):
+def delete_session_file(sid: str, uid: int):
+    session_dir = os.path.join(SESSION_DIR, str(uid), sid)
     try:
-        os.remove(session_file_path(sid))
+        shutil.rmtree(session_dir)
     except FileNotFoundError:
         pass
 
@@ -1395,7 +1399,7 @@ async def delete_session_confirm(cb: CallbackQuery, state: FSMContext):
     await _db.execute("DELETE FROM msgs WHERE sid=?", (sid,))
     await _db.execute("DELETE FROM sessions WHERE id=?", (sid,))
     await _db.commit()
-    delete_session_file(sid)
+    delete_session_file(sid, uid)
     await cb.message.edit_text(f"Session [{sid}] deleted.")
     user = await get_user(_db, uid)
     await _send_sessions_list(cb.message, uid, user.get("key_name") or "")
