@@ -31,6 +31,7 @@ from aiogram.types import (
     KeyboardButton,
     Message,
     ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
 )
 import openai
 from openai import AsyncOpenAI
@@ -1530,7 +1531,7 @@ async def help_cmd(msg: Message, state: FSMContext):
         "<b>Главное меню:</b>\n"
         "• <b>+ New Session</b> — создать новую сессию (выбор модели)\n"
         "• <b>≡ Sessions</b> — список сессий, открыть или удалить\n"
-        "• <b>? Help</b> — эта справка\n\n"
+        "• <b>? Help</b> — эта справка\n""• <b>⇄ Re-auth</b> — сменить ключ доступа\n\n"
         "<b>Внутри сессии:</b>\n"
         "• <b>Clear</b> — очистить историю сообщений\n"
         "• <b>Close Session</b> — закрыть сессию (история сохраняется)\n"
@@ -1702,6 +1703,16 @@ async def main():
     finally:
         await _db.close()
         LOG.info("QwenBot stopped.")
+
+
+
+@dp.message(StateFilter(S.main), F.text == "⇄ Re-auth")
+async def reauth_cmd(msg: Message, state: FSMContext):
+    uid = msg.from_user.id
+    await _db.execute("UPDATE users SET authed=0, key_name=NULL WHERE uid=?", (uid,))
+    await _db.commit()
+    await state.set_state(S.auth)
+    await msg.answer("🔑 Enter your access key:", reply_markup=ReplyKeyboardRemove())
 
 
 if __name__ == "__main__":
