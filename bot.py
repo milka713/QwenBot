@@ -40,7 +40,7 @@ DB_PATH        = os.environ.get("DB_PATH",    "/home/mark/qwenbot/data.db")
 KEYS_PATH      = os.environ.get("KEYS_PATH",  "/opt/api-keys.txt")
 MAX_FAILS      = 3
 BAN_MINUTES    = 5
-MAX_AGENT_TURNS = 20
+MAX_AGENT_TURNS = 40
 BASH_TIMEOUT    = 60
 TOOL_OUT_LIMIT  = 5000
 
