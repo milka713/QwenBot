@@ -1,0 +1,17 @@
+[Unit]
+Description=QwenBot Telegram Bot
+After=network.target
+
+[Service]
+Type=simple
+User=mark
+WorkingDirectory=/home/mark/qwenbot
+ExecStart=/home/mark/qwenbot/venv/bin/python /home/mark/qwenbot/bot.py
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
