@@ -423,7 +423,7 @@ class _TGResolver(AbstractResolver):
 MAIN_KB = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="+ New Session"), KeyboardButton(text="≡ Sessions")],
-        [KeyboardButton(text="? Help")],
+        [KeyboardButton(text="? Help"),        KeyboardButton(text="⇄ Re-auth")],
     ],
     resize_keyboard=True,
     is_persistent=True,
